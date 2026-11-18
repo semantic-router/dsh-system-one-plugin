@@ -46,6 +46,23 @@ export function imageSize(buffer) {
   return undefined
 }
 
+const COLORS = { 0: 'greyscale', 2: 'RGB', 3: 'palette', 4: 'greyscale and alpha', 6: 'RGBA' }
+
+/**
+ * Why marks cannot be drawn on a copy of this image, in a few words ("not a PNG", "a 16-bit RGB PNG", "an interlaced
+ * PNG"), from its header; undefined for an 8-bit, non-interlaced PNG, which decodePng reads.
+ */
+export function undrawable(buffer) {
+  if (imageSize(buffer)?.type !== 'png') return 'not a PNG'
+  if (buffer.length < 33) return 'a PNG cut short'
+  const depth = buffer[24]
+  const color = buffer[25]
+  if (buffer[28] !== 0) return 'an interlaced PNG'
+  if (!COLORS[color]) return 'a PNG of an unknown color type'
+  if (depth !== 8) return `a ${depth}-bit ${COLORS[color]} PNG`
+  return undefined
+}
+
 /** An 8-bit, non-interlaced PNG (grey, RGB, palette, with or without alpha) as RGBA pixels. */
 export function decodePng(buffer) {
   if (!buffer.subarray(0, 8).equals(SIGNATURE)) throw new Error('not a PNG')

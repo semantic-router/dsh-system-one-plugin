@@ -24,18 +24,19 @@ export const REQUEST_TOKENS = 112000
 export const stateCost = state => Buffer.byteLength(typeof state === 'string' ? state : JSON.stringify(state ?? '')) + 160
 
 /**
- * Consecutive slices of `states`, at most {@link ITEMS_PER_REQUEST} each, whose `questions` questions per state stay
- * within {@link REQUEST_TOKENS}.
+ * Consecutive slices of `states`, at most {@link ITEMS_PER_REQUEST} each, whose `questions` questions per state (one
+ * number for all, or one for each state) stay within {@link REQUEST_TOKENS}.
  * @returns {Array<{start: number, count: number}>}
  */
 export function requestSlices(states, questions) {
+  const asks = index => Math.max(1, Array.isArray(questions) ? questions[index] ?? 1 : questions)
   const slices = []
   let start = 0
   while (start < states.length) {
     let count = 0
     let cost = 0
     while (start + count < states.length && count < ITEMS_PER_REQUEST) {
-      const next = stateCost(states[start + count]) * Math.max(1, questions)
+      const next = stateCost(states[start + count]) * asks(start + count)
       if (count > 0 && cost + next > REQUEST_TOKENS) break
       cost += next
       count++
@@ -65,13 +66,17 @@ function expandHome(path) {
  * @param {string} options.apiKeyEnv - environment variable holding the key
  * @param {string} [options.apiKeyFile] - mode-600 file holding the key, read when the variable is unset
  * @param {() => Promise<string | undefined>} [options.resolveKey] - the key from DeepSeek Harness's credential store, asked first
- * @param {number} [options.maxConcurrency]
+ * @param {number} [options.maxConcurrency] - requests at once, at least one; a batch leaves one of them to the reflexes
  * @param {number} [options.timeoutMs]
  * @param {number} [options.retries]
  */
 export function createDecisionClient(options) {
   const baseURL = options.baseURL.replace(/\/+$/, '')
-  const maxConcurrency = options.maxConcurrency ?? 12
+  // none at once would make every call wait forever
+  const wanted = Number(options.maxConcurrency ?? 12)
+  const maxConcurrency = Number.isFinite(wanted) ? Math.max(1, Math.floor(wanted)) : 12
+  // a batch's slices never take the last slot, so a guard, a shield or a triage never waits behind a batch
+  const batchSlots = Math.max(1, maxConcurrency - 1)
   const timeoutMs = options.timeoutMs ?? 30000
   const retries = options.retries ?? 3
   const endpoint = new URL(baseURL)
@@ -80,6 +85,7 @@ export function createDecisionClient(options) {
   // socket in between and pay a new TLS handshake on every decision.
   const agent = new transport.Agent({ keepAlive: true, keepAliveMsecs: 15000, maxSockets: maxConcurrency, scheduling: 'lifo' })
   let active = 0
+  let activeBatch = 0
   const waiting = []
 
   function send(path, method, payload, headers, signal) {
@@ -110,30 +116,39 @@ export function createDecisionClient(options) {
     return undefined
   }
 
-  async function acquire(signal) {
-    while (active >= maxConcurrency) {
+  const free = batch => active < maxConcurrency && (!batch || activeBatch < batchSlots)
+
+  async function acquire(batch, signal) {
+    while (!free(batch)) {
       signal?.throwIfAborted()
       // A cancelled caller leaves the queue at once: a wakeup it took without taking the slot would be lost for good.
       await new Promise((resolve, reject) => {
-        const wake = () => {
-          signal?.removeEventListener('abort', cancel)
-          resolve()
+        const waiter = {
+          batch,
+          wake: () => {
+            signal?.removeEventListener('abort', cancel)
+            resolve()
+          },
         }
         const cancel = () => {
-          const at = waiting.indexOf(wake)
+          const at = waiting.indexOf(waiter)
           if (at >= 0) waiting.splice(at, 1)
           reject(signal.reason)
         }
-        waiting.push(wake)
+        waiting.push(waiter)
         signal?.addEventListener('abort', cancel, { once: true })
       })
     }
     active++
+    if (batch) activeBatch++
   }
 
-  function release() {
+  function release(batch) {
     active--
-    waiting.shift()?.()
+    if (batch) activeBatch--
+    // the first in line that may start now: a reflex takes any free slot, a batch's slice one of the batch's own
+    const at = waiting.findIndex(waiter => free(waiter.batch))
+    if (at >= 0) waiting.splice(at, 1)[0].wake()
   }
 
   async function post(path, body, signal, limits = {}) {
@@ -149,7 +164,8 @@ export function createDecisionClient(options) {
       'content-length': Buffer.byteLength(payload),
     }
     for (let attempt = 0; ; attempt++) {
-      const deadline = AbortSignal.timeout(deadlineMs)
+      // the first try keeps the deadline that started before the call waited for its slot
+      const deadline = (attempt === 0 && limits.deadline) || AbortSignal.timeout(deadlineMs)
       let response
       try {
         response = await send(path, 'POST', payload, headers, signal ? AbortSignal.any([signal, deadline]) : deadline)
@@ -198,10 +214,12 @@ export function createDecisionClient(options) {
    * @param {number} [request.retries] - per-call retries (default: the client's)
    * @param {number} [request.waitMs] - the longest wait before a retry after a 429, 502 or 503: the gateway's
    *   Retry-After, up to this (default 10 s)
+   * @param {boolean} [request.batch] - one slice of the system_one tool's batch: it waits for a slot of the batch's
+   *   own, without a deadline, and leaves one slot to the reflexes; any other call's deadline counts its wait
    * @returns {Promise<{answers: object[], spans: object[], thresholds: object[], ms: number, model: string, inputTokens: number, requestId?: string}>}
    *   answers, span answers and the thresholds applied, in input order
    */
-  async function ask({ model, questions, inputs, signal, timeoutMs: callTimeoutMs, retries: callRetries, waitMs }) {
+  async function ask({ model, questions, inputs, signal, timeoutMs: callTimeoutMs, retries: callRetries, waitMs, batch = false }) {
     if (inputs.length === 0 || inputs.length > ITEMS_PER_REQUEST) {
       throw new RangeError(`one request answers 1 to ${ITEMS_PER_REQUEST} inputs, got ${inputs.length}`)
     }
@@ -209,16 +227,23 @@ export function createDecisionClient(options) {
     // a batch has nothing of a standard request beside its entries, named "1", "2", ... in input order
     const name = index => String(index + 1)
     const body = inputs.length === 1 ? { model, ...entry(inputs[0]) } : { model, states: Object.fromEntries(inputs.map((input, index) => [name(index), entry(input)])) }
-    await acquire(signal)
+    const deadlineMs = callTimeoutMs ?? timeoutMs
+    const deadline = batch ? undefined : AbortSignal.timeout(deadlineMs)
+    try {
+      await acquire(batch, deadline ? (signal ? AbortSignal.any([signal, deadline]) : deadline) : signal)
+    } catch (error) {
+      if (signal?.aborted || !deadline?.aborted) throw error
+      throw new DecisionError(`Decision API busy: no request slot came free within ${Math.round(deadlineMs / 100) / 10} s`, 0, 'busy')
+    }
     const started = performance.now()
     try {
-      const { json, requestId } = await post('/v1/decisions', body, signal, { timeoutMs: callTimeoutMs, retries: callRetries, waitMs })
+      const { json, requestId } = await post('/v1/decisions', body, signal, { timeoutMs: deadlineMs, retries: callRetries, waitMs, deadline })
       const each = field => (inputs.length === 1 ? [json[field] ?? {}] : inputs.map((_, index) => json.states?.[name(index)]?.[field] ?? {}))
       // a batch's usage counts every entry
       const inputTokens = json.usage?.input_tokens ?? 0
       return { answers: each('answers'), spans: each('spans'), thresholds: each('thresholds'), ms: performance.now() - started, model: json.model ?? model, inputTokens, requestId }
     } finally {
-      release()
+      release(batch)
     }
   }
 
@@ -236,6 +261,39 @@ export function createDecisionClient(options) {
   }
 
   return { ask, warm, models, hasKey: async () => Boolean(await apiKey()), close: () => agent.destroy() }
+}
+
+/**
+ * Ask about many inputs, each with its own questions, in as few requests as the limits allow ({@link requestSlices}),
+ * all at once. The first request that fails stops the others, and the call fails with its error.
+ * @param {ReturnType<typeof createDecisionClient>} client
+ * @param {Array<{state: string | object, questions: object, images?: string[]}>} inputs
+ * @param {object} request - as `client.ask` takes it, without `inputs`
+ * @returns {Promise<{answers: object[], spans: object[], thresholds: object[], ms: number, model: string, inputTokens: number, requestId?: string}>}
+ *   in input order; `ms` is the time all of them took
+ */
+export async function askAll(client, inputs, { signal, ...request }) {
+  const slices = requestSlices(inputs.map(input => input.state), inputs.map(input => Object.keys(input.questions ?? {}).length))
+  const stop = new AbortController()
+  const either = signal ? AbortSignal.any([signal, stop.signal]) : stop.signal
+  const started = performance.now()
+  const responses = await Promise.all(slices.map(({ start, count }) => client.ask({
+    ...request,
+    inputs: inputs.slice(start, start + count).map(({ state, questions, images }) => ({ state, questions, ...(images ? { images } : {}) })),
+    signal: either,
+  }).catch(error => {
+    stop.abort(error)
+    throw error
+  })))
+  return {
+    answers: responses.flatMap(response => response.answers),
+    spans: responses.flatMap(response => response.spans),
+    thresholds: responses.flatMap(response => response.thresholds),
+    ms: performance.now() - started,
+    model: responses[0].model,
+    inputTokens: responses.reduce((sum, response) => sum + response.inputTokens, 0),
+    requestId: responses[0].requestId,
+  }
 }
 
 /**

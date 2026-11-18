@@ -56,6 +56,8 @@ window.__ModuleLoader__.load({
         clean: { label: 'Clean', short: 'clean', tone: 'ok' },
         removed: { label: 'Injection removed', short: 'injection removed', tone: 'bad' },
         flagged: { label: 'Injection found', short: 'injection found', tone: 'bad' },
+        // the screened part was clean, and the part past what the shield screens was kept from System Two
+        withheld: { label: 'Rest withheld', short: 'rest withheld', tone: 'warn' },
       }
       const DONE = {
         complete: { label: 'Done', tone: 'ok' },
@@ -314,6 +316,12 @@ window.__ModuleLoader__.load({
         if (onTask !== undefined) facts.push({ id: 'on-task', label: 'On task', value: p2(onTask), bar: onTask })
         if (harm !== undefined) facts.push({ id: 'harm', label: 'Harmful call', value: p2(harm), bar: harm })
         if (unsafe !== undefined) facts.push({ id: 'request-harm', label: 'Harmful request', value: p2(unsafe), bar: unsafe })
+        // a long call: how much of it the guard read, in how many windows
+        const chars = num(row.chars)
+        if (chars !== undefined) {
+          const reviewed = num(row.reviewed) ?? chars
+          facts.push({ id: 'reviewed', label: 'Reviewed', value: `${reviewed === chars ? 'all' : reviewed} of ${plural(chars, 'character')}${num(row.windows) > 1 ? ` · ${row.windows} parts` : ''}`, tone: reviewed < chars ? 'warn' : undefined })
+        }
         const danger = Array.isArray(row.danger) ? row.danger.filter(span => typeof span?.text === 'string' && span.text) : []
         return {
           verdict: row.verdict, ...verdict, subject: danger.length ? { ...subject, marks: danger, kind: 'dangerous' } : subject, facts, outcome, outcomeKey: outcome ? row.outcome : undefined, verdictTone: verdict.tone,
@@ -328,16 +336,20 @@ window.__ModuleLoader__.load({
         const lines = num(row.removedLines) ?? 0
         const spans = num(row.removedSpans) ?? 0
         const what = spans ? `${plural(spans, 'span')} of text (${plural(num(row.removedChars) ?? 0, 'character')})` : plural(lines, 'line')
+        const withheld = num(row.withheld)
+        const rest = withheld ? ` System One screens the first ${plural(num(row.screenedChars) ?? 0, 'character')} of a result; System Two got none of the last ${plural(withheld, 'character')}, only a note to read them in parts.` : ''
         return {
           verdict: row.verdict, ...verdict, subject: { tool: row.tool, text: row.call },
           facts: [
             { id: 'passages', label: 'Passages', value: String(num(row.passages) ?? '?') },
             { id: 'injection', label: 'Injection', value: p2(row.maxP), bar: num(row.maxP), tone: row.maxP >= 0.5 ? 'bad' : undefined },
             ...(spans ? [{ id: 'spans', label: 'Spans removed', value: String(spans) }] : []),
+            ...(withheld ? [{ id: 'withheld', label: 'Withheld', value: plural(withheld, 'character'), tone: 'warn' }] : []),
           ],
           excerpts: Array.isArray(row.excerpts) ? { list: row.excerpts, kind: 'removed' } : undefined,
-          note: row.verdict === 'removed' ? `Removed ${what} that gave orders to AI agents before System Two read the result${spans ? '; the text around it stayed' : ''}.`
-            : row.verdict === 'flagged' ? `Found ${what} that give orders to AI agents; the result was withheld.` : undefined,
+          note: row.verdict === 'removed' ? `Removed ${what} that gave orders to AI agents before System Two read the result${spans ? '; the text around it stayed' : ''}.${rest}`
+            : row.verdict === 'flagged' ? `Found ${what} that give orders to AI agents; the result was withheld.`
+              : rest ? rest.trim() : undefined,
         }
       }
 
@@ -1020,6 +1032,9 @@ window.__ModuleLoader__.load({
         const entries = Object.entries(meta.summary ?? {})
         const redacted = meta.redacted && typeof meta.redacted === 'object' ? meta.redacted : undefined
         const annotated = meta.annotated && Array.isArray(meta.annotated.files) ? meta.annotated : undefined
+        const skipped = Array.isArray(annotated?.skipped) ? annotated.skipped.filter(entry => text(entry)) : []
+        const pseudonyms = num(meta.pseudonyms?.items) ? meta.pseudonyms : undefined
+        const partial = num(meta.partial?.failed) ? meta.partial : undefined
         const sources = Array.isArray(meta.sources) ? meta.sources.filter(source => text(source)) : []
         return h('div', { className: 'vsr-s1__rows', 'data-system-one-part': 'rows' },
           entries.map(([id, summary]) => h(Question, { key: id, id, summary, fresh, examples: meta.examples?.[id] })),
@@ -1029,9 +1044,16 @@ window.__ModuleLoader__.load({
             'Redacted copy ', h(FileLink, { path: text(redacted.output), cwd, openFile }),
             ` · ${plural(num(redacted.spans) ?? 0, 'span')} in ${plural(num(redacted.items) ?? 0, 'item')} replaced by their [LABEL]`) : null,
           annotated ? h('div', { className: 'vsr-s1__foot', 'data-system-one-part': 'annotated' },
-            annotated.files.length ? 'Annotated copies ' : 'No box found to draw',
+            annotated.files.length ? 'Annotated copies ' : skipped.length ? 'No annotated copy' : 'No box found to draw',
             fileList(annotated.files, cwd, openFile),
             annotated.files.length > 4 ? ` and ${annotated.files.length - 4} more` : '') : null,
+          skipped.length ? h('div', { className: 'vsr-s1__foot', 'data-system-one-part': 'skipped' },
+            `Not drawn on: ${skipped.slice(0, 4).join(', ')}${skipped.length > 4 ? ` and ${skipped.length - 4} more` : ''}; their boxes are in the results`) : null,
+          pseudonyms ? h('div', { className: 'vsr-s1__foot', 'data-system-one-part': 'pseudonyms' },
+            `${plural(pseudonyms.items, 'item id')} ${pseudonyms.items === 1 ? 'is' : 'are'} personal data (${Object.keys(pseudonyms.labels ?? {}).join(', ')}): `,
+            pseudonyms.named === 'pseudonyms' ? 'System Two and the redacted copy see pseudonyms; the results file keeps each id beside its pseudonym' : 'kept as they are, as pseudonymIds is off') : null,
+          partial ? h('div', { className: 'vsr-s1__foot', 'data-system-one-part': 'partial' },
+            `${partial.failed} of ${plural(partial.requests, 'request')} failed: ${plural(partial.items, 'item')} ${partial.items === 1 ? 'has' : 'have'} an error in place of answers`) : null,
           sources.length ? h('div', { className: 'vsr-s1__foot', 'data-system-one-part': 'sources' }, 'Checked against ', fileList(sources, cwd, openFile)) : null,
           fullModel(meta.spanModel) && fullModel(meta.spanModel) !== fullModel(meta.model)
             ? h('div', { className: 'vsr-s1__foot', 'data-system-one-part': 'span-model' }, 'Spans by ', h('b', { className: 'vsr-s1__by' }, fullModel(meta.spanModel))) : null)

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import { test } from 'node:test'
-import { ITEMS_PER_REQUEST, REQUEST_TOKENS, createDecisionClient, requestSlices, stateCost } from '../src/client.js'
+import { ITEMS_PER_REQUEST, REQUEST_TOKENS, askAll, createDecisionClient, requestSlices, stateCost } from '../src/client.js'
 
 function fakeApi(handler) {
   return new Promise(resolve => {
@@ -166,6 +166,96 @@ test('a caller cancelled while it waits for a slot leaves the queue and the next
   held.shift()()
   const r = await third
   assert.equal(r.answers.length, 1)
+})
+
+test('a reflex never waits behind a batch: one slot stays free for it, its deadline counts its wait, and there is always a slot', { timeout: 10000 }, async t => {
+  // a batch's slices are held until the test lets them answer; anything else answers at once
+  const held = []
+  const { server, url } = await fakeApi((body, request, response) => {
+    const reply = () => response.end(JSON.stringify({ answers: answer(body.state), model: body.model, usage: { input_tokens: 1 } }))
+    if (body.state.startsWith('slice')) held.push(reply)
+    else reply()
+  })
+  process.env.S1_TEST_KEY = 'sk-vsr-test'
+  const clients = []
+  t.after(() => {
+    clients.forEach(client => client.close())
+    server.closeAllConnections()
+    server.close()
+  })
+  const make = maxConcurrency => {
+    const client = createDecisionClient({ baseURL: url, apiKeyEnv: 'S1_TEST_KEY', maxConcurrency })
+    clients.push(client)
+    return client
+  }
+  const ask = (client, state, extra = {}) => client.ask({ model: 'm', questions: {}, inputs: [{ state }], ...extra })
+  const until = async test => {
+    while (!test()) await new Promise(resolve => setTimeout(resolve, 5))
+  }
+
+  // two slots: a batch of three slices takes one, the guard gets the other at once
+  const two = make(2)
+  const slices = [1, 2, 3].map(i => ask(two, `slice ${i}`, { batch: true }))
+  await until(() => held.length === 1)
+  const started = Date.now()
+  const guard = await ask(two, 'guard', { timeoutMs: 2000 })
+  assert.equal(guard.answers.length, 1)
+  assert.ok(Date.now() - started < 1000)
+  assert.equal(held.length, 1, 'the batch keeps to its own slot')
+  // its slices take turns through that slot
+  for (let turn = 0; turn < 3; turn++) {
+    await until(() => held.length === 1)
+    held.shift()()
+  }
+  assert.equal((await Promise.all(slices)).length, 3)
+
+  // one slot, held by a batch: a reflex fails at its deadline, which started before it waited, instead of waiting on
+  const one = make(1)
+  const slow = ask(one, 'slice long', { batch: true })
+  await until(() => held.length === 1)
+  const waited = Date.now()
+  await assert.rejects(ask(one, 'triage', { timeoutMs: 300, retries: 0 }), /Decision API busy: no request slot came free within 0\.3 s/)
+  assert.ok(Date.now() - waited < 1500)
+  held.shift()()
+  await slow
+
+  // maxConcurrency 0 still sends one request at a time, rather than none ever
+  const none = make(0)
+  assert.equal((await ask(none, 'triage', { timeoutMs: 2000 })).answers.length, 1)
+})
+
+test('several inputs with questions of their own go in as few requests as the estimate allows, and the first failure stops the rest', async t => {
+  const seen = []
+  const { server, url } = await fakeApi((body, request, response) => {
+    const inputs = body.states ? Object.values(body.states) : [body]
+    seen.push(inputs.map(input => Object.keys(input.questions)))
+    if (inputs.some(input => input.state === 'refused')) {
+      response.writeHead(503, { 'content-type': 'application/json' })
+      return response.end(JSON.stringify({ error: { code: 'unavailable' } }))
+    }
+    const of = input => ({ answers: answer(input.state) })
+    if (!body.states) return response.end(JSON.stringify({ model: body.model, ...of(body), usage: { input_tokens: 1 } }))
+    setTimeout(() => response.end(JSON.stringify({ model: body.model, states: Object.fromEntries(Object.entries(body.states).map(([id, input]) => [id, of(input)])), usage: { input_tokens: inputs.length } })), 30)
+  })
+  process.env.S1_TEST_KEY = 'sk-vsr-test'
+  const client = createDecisionClient({ baseURL: url, apiKeyEnv: 'S1_TEST_KEY' })
+  t.after(() => {
+    client.close()
+    server.close()
+  })
+  const big = 'x'.repeat(30000)
+  const inputs = [
+    { state: big, questions: { a: {}, b: {}, c: {} } },
+    { state: 'attack', questions: { injection: {} } },
+    { state: big, questions: { a: {}, b: {} } },
+    { state: 'clean', questions: { injection: {} } },
+  ]
+  const all = await askAll(client, inputs, { model: 'm' })
+  assert.deepEqual(all.answers.map(answers => answers.injection.noul), [0.01, 0.99, 0.01, 0.01])
+  // three questions over 30,000 bytes and two more over as many are more than one request may estimate
+  assert.deepEqual(requestSlices(inputs.map(input => input.state), inputs.map(input => Object.keys(input.questions).length)), [{ start: 0, count: 2 }, { start: 2, count: 2 }])
+  assert.equal(seen.length, 2)
+  await assert.rejects(askAll(client, [{ state: big, questions: { a: {}, b: {}, c: {} } }, { state: 'refused', questions: { a: {} } }, { state: big, questions: { a: {}, b: {}, c: {} } }], { model: 'm', retries: 0 }), /Decision API 503/)
 })
 
 test('a missing key is a clear error', async () => {

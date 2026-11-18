@@ -77,6 +77,33 @@ of your profile patch stay as they are.
 | Tool | `system_one` | any rubric the LLM writes, over a file of items or images: choices, yes/no, scores, boxes, the words that carry its labels, personal data, claims its sources don't back, router signals | one result row per item (JSONL or CSV), a summary, and on request a redacted copy or annotated images |
 | Screen | `system_one_screen` | on one screenshot: where to click, what the screen shows, whether the last action worked | the pixel to click and the box of each target, the answers, and a verdict on the action |
 
+### What the reflexes read, and how much
+
+The reflexes read DeepSeek Harness's tools by what the tools do, not by a few names. In each list, a name that ends in
+`*` stands for every tool whose name starts with the rest (an MCP server's tools are `mcp__<server>__<tool>`).
+
+- **Shield** (`shieldTools`) screens every result that brings in text from files (`read`, `grep`, `glob`,
+  `str_replace_editor`), shells (`bash`, Windows' `pwsh`, a background job's `job_output`), the web (`web_fetch`,
+  `web_search`) or an MCP server (`read_mcp_resource`, `mcp__*`). It screens a result of any length that has a word in
+  it (`shieldMinChars`, 0), in passages of about 700 characters, nine to a request: every passage of the first 60,000
+  characters (`shieldMaxChars`). System Two gets none of the rest. In its place a note says how many characters were
+  withheld unscreened and asks System Two to read them in parts (a range of lines, a narrower search or command), and
+  the card says **Rest withheld**. A `read` returns at most 50 KB, so a file is screened whole; a long web page or a
+  long command output can be cut. If the shield cannot answer, the result passes as it is and its card says so.
+- **Privacy** (`privacyTools`) masks the text of files, shells and the web: `read`, `grep`, `str_replace_editor`,
+  `bash`, `pwsh`, `job_output`, `web_fetch` and `web_search`, all of a result, in windows of 12,000 characters that end
+  at a line break or a space. `glob`'s file names and MCP tools are masked only when you name them: a masked name in a
+  path would leave System Two unable to open the file.
+- **Guard** (`guardTools`) reviews every call that runs a command (`bash`, `pwsh`), writes a file (`write`, `edit`,
+  `apply_patch`, and `str_replace_editor` but for its `view`), sends data out (`web_fetch`'s address, `web_search`'s
+  queries), plans a prompt for later (`schedule_create`, `schedule_update`) or acts through an MCP server (`mcp__*`).
+  It reads a call whole: the command, the content a write writes, an edit's text before and after, the patch, and a
+  wider sandbox the call asks for, up to 24,000 characters (`guardMaxChars`), in windows of 3,000 characters that
+  overlap by 300, so that a command across a window's end is seen whole in the next. The riskiest window decides, and
+  the card names its dangerous part. A call longer than that is never allowed unasked, however safe its start: the
+  guard asks you, and with `guardAskMode: deny` (or headless, where nobody can answer) it is denied with the advice to
+  split it into calls System One can read whole. The card says how much of a long call it read.
+
 ### System Two through the router
 
 `vllm-sr/auto` is vLLM Semantic Router: it reads each request and picks the model and the reasoning for it. The plugin
@@ -199,11 +226,40 @@ Beside the rubric:
   ids in its text that the span model takes for names (`C-2087`), and a marked person's name is masked wherever it
   or a part of it recurs in the item.
 - `annotate`: a directory for PNG copies of the images with the boxes found drawn in red, or `true` for a copy beside
-  each image (`<name>.annotated.png`).
+  each image (`<name>.annotated.png`). An image it cannot draw on (not a PNG, a PNG of 16 bits or of fewer than 8 per
+  channel, an interlaced one) is answered all the same and listed with why, and its boxes are in the results.
 
 The results file holds one row per item: its id, its answers and the start of its text. A call that asks `attack`,
 `p_harm`, `r_harm` or `r_refusal` keeps ids and answers only, so reading the results brings none of the flagged
-words into System Two's context.
+words into System Two's context. In a CSV, and in the first rows the summary shows, each answer takes a column of its
+own beside the item's `id` (a choice its id and `<id>_confidence`, a yes/no question `<id>_yes`, a span question
+`<id>`, `<id>_labels` and `<id>_spans`), and every header is escaped as a cell is, so a question id with a comma, a
+quote or a line break keeps its column. A question named `id` or `pseudonym`, or two questions whose answers would
+take one column (`team` beside a question named `team_confidence`), are refused before anything is asked, with what
+to rename.
+
+**Item ids that are personal data.** An item keeps its id, so that the results, the redacted copy and the summary
+match. In a call that looks for personal data (preset `pii`, or `redact`), an id that is personal data, because pii
+marks it in the id's own field or because it is shaped as an email address, an IP address or a phone number, is named
+by a pseudonym in everything System Two reads of the call (the summary, its first rows and examples) and in the
+redacted copy, as `EMAIL_ADDRESS-3f9a2c1b0d`: its label and 10 hex digits of an HMAC-SHA256 of the id under a key that
+stays on your machine, so one id has one pseudonym in every call and every copy, and nobody without the key can tell
+which id it stands for by hashing guesses. The results file keeps each id beside its pseudonym (`pseudonym`), for you
+to act on. The summary's Notes line says how many ids were named this way. `pseudonymIds: false` keeps such ids as
+they are, and the Notes line and the card say so.
+
+**When a request fails.** A call's items go to System One in requests of up to nine; each request stands on its own.
+The items of a request that failed carry its error in place of their answers (in the results file too), the summary
+counts them under each question, and the Notes line and the card say how many requests and items failed. When System
+One is unavailable after a request's retries (a refused key, a spent quota), the call's requests still waiting are not
+sent, and their items say so; a call none of whose requests was answered fails as unavailable. A redacted copy is
+written whole or not at all: if any item's personal data was not looked for, no copy is written, and the Notes line
+says why. The results are written before the redacted copy and the annotated images, so a later failure leaves them.
+
+**Never over a file it reads.** The results, the redacted copy and the annotated images never land on a file the call
+reads (the input file, an image, a source), under any name: the same path, the same path in another letter case (one
+file on Windows and macOS, refused everywhere), a link or a hard link to it. Such a path is refused before anything is
+asked, and an annotated copy that would land on an image goes beside its own image instead.
 
 The results, the redacted copy and the annotated images (of `system_one_screen` too) are written only where
 DeepSeek Harness lets its own write tool write in the session: under `read-only` nothing is written and the answers
@@ -222,7 +278,9 @@ For computer use, System One is the eyes of each step. System Two gives it one s
 - `before` and `action`: the screenshot from before the last action and what that action was; System One says
   whether it worked, from the two screenshots (`before` alone is judged as the last step of the task).
 - `annotate`: a PNG copy with the boxes in red and the click points in blue: a `.png` path, a folder for it (a path
-  without an image extension), or `true` for one beside the screenshot.
+  without an image extension), or `true` for one beside the screenshot. A copy named as a screenshot the call reads
+  (`image` or `before`, under any name) goes beside `image`; a screenshot the annotator cannot draw on is answered,
+  with a note and no copy.
 
 What to ask written under another name (`targets` for `find`, `checks` for `check`, `expected` for `expect`), a
 question written alone as `question`, and a box question written as a check are read as what they mean.
@@ -290,7 +348,7 @@ attributes that say what it shows:
 | --- | --- |
 | `data-system-one` | `card`, `compact` (one line), `tool` (the `system_one` row, and the line a finished turn keeps for each call), `screen` (the same for `system_one_screen`) or `notice` (the free-key line) |
 | `data-system-one-reflex` | `triage`, `guard`, `shield`, `privacy`, `done`, `tool`, `screen` or `key` |
-| `data-system-one-verdict` | triage `brief`; guard `allow`, `ask` or `deny`; shield `clean`, `removed` or `flagged`; privacy `masked` or `clean`; done-check `stop` or `continue`; tool and screen `running`, `done`, `unavailable` (System One could not answer the call) or `retried` (an argument error: a hidden element, `hidden` and `data-system-one-hidden="arguments"`, that draws nothing); key `created` or `failed`; `deciding` while System One has not answered yet, `cancelled` when the turn or the call stopped first; `error` when System One did not answer a reflex |
+| `data-system-one-verdict` | triage `brief`; guard `allow`, `ask` or `deny`; shield `clean`, `removed`, `flagged` or `withheld` (clean, and the rest past what it screens kept from System Two); privacy `masked` or `clean`; done-check `stop` or `continue`; tool and screen `running`, `done`, `unavailable` (System One could not answer the call) or `retried` (an argument error: a hidden element, `hidden` and `data-system-one-hidden="arguments"`, that draws nothing); key `created` or `failed`; `deciding` while System One has not answered yet, `cancelled` when the turn or the call stopped first; `error` when System One did not answer a reflex |
 | `data-system-one-outcome` | guard, once you answer its approval: `allowed`, `rejected`, `cancelled` or `failed` |
 | `data-system-one-why` | done-check: `complete`, `waiting`, `declined`, `unfinished`, `unchecked` or `unsupported` |
 | `data-system-one-tone` | the tone of what it decided: `ok` and `info` (blue), `warn` (amber: it asks you, or sends System Two back), `bad` (red: it blocked or removed something) or `muted`; a card's frame is blue whatever its tone |
@@ -306,7 +364,8 @@ attributes that say what it shows:
 Inside a root, `data-system-one-part` marks `icon` (the line's icon slot), `badge` (**System One**, in blue),
 `latency`, `reflex`, `summary`, `model`, `head`, `toggle` (the button of a one-line element), `rows`, `verdict`,
 `outcome`, `subject`, `facts`, `note`, `span-model` (a second model, named in a card), `more` and `progress` (the
-shimmer while it decides), in the batch row also `stack`, `legend`, `failed`, `results` and `raw` (and, in an
+shimmer while it decides), in the batch row also `stack`, `legend`, `failed`, `results`, `raw`, `pseudonyms` (ids
+named by pseudonyms), `partial` (requests that failed) and `skipped` (images not drawn on) (and, in an
 **Unavailable** line opened, `inspect`: DeepSeek Harness's inspector for the call), and in the free-key
 line `icon`, `badge` (**System Duo**), `summary` and `links`. Span answers add `excerpts`, each `excerpt`, every marked
 `span` (with `data-system-one-span-label` and `data-system-one-probability`) and, in a Privacy card, the `labels`. A
@@ -317,9 +376,9 @@ passage; the batch row adds `images`, each `image` (`data-system-one-item`) with
 `redacted`, `annotated` and `sources`. The screen row shows the `shot` with each `box` (`data-system-one-box`, the
 target) and `point` (where to click), the `targets`, each `target` (`data-system-one-target`) with its `click`, the
 `checks`, `expect`, and an `action` with the `before` and `after` screens, and `annotated`. Each number is a
-`data-system-one-fact`: `kind`, `effort`, `unclear` and `risky` (triage), `risk`, `leaks`, `on-task`, and the router
-signals `harm` (the call) and `request-harm` (the request it serves) (guard), `passages`, `injection` and `spans`
-(shield), `masked` (privacy), `complete`, `checked`, `waiting`, the router signal `declined`, `unsupported` and
+`data-system-one-fact`: `kind`, `effort`, `unclear` and `risky` (triage), `risk`, `leaks`, `on-task`, the router
+signals `harm` (the call) and `request-harm` (the request it serves), and `reviewed` (how much of a long call it read)
+(guard), `passages`, `injection`, `spans` and `withheld` (shield), `masked` (privacy), `complete`, `checked`, `waiting`, the router signal `declined`, `unsupported` and
 `backed` (done-check), and in a screen row each check by its id. Decision rows carry `data-system-one-decision` and
 `data-system-one-call`. For example:
 
@@ -380,6 +439,10 @@ and flags named for a key, token, secret or password (`DECISION_API_KEY=…`, `"
 that an earlier version wrote is scrubbed the same way, once, when the plugin starts (its first line then says so).
 Set `trace: off` to disable it.
 
+The key of the pseudonyms that name item ids holding personal data (`~/.dsh/system-one/pseudonyms.key`, readable by
+you only) is made on first use and never leaves your machine. Delete it to start new pseudonyms; with it, someone
+could test which id a pseudonym stands for, so keep it as you keep the results files.
+
 For the Web UI, each decision is also written to the session's own log as a plugin record
 (`plugin:vllm-sr/dsh/system-one`): its answers, model, latency and verdict, and the reviewed call in short with
 secret-shaped strings redacted. A `route` record holds what the router named for one System Two call: `model`, `lane` (its
@@ -406,8 +469,13 @@ Every field has a default. Set any of them on the `system-one` row of a profile 
     guardHarmAt: 0.9               # r_harm that asks about a call the questions allowed
     guardHarmDenyAt: 0.98          # r_harm and p_harm, both this sure, deny a call the questions asked about
     doneRefusalAt: 0.5             # r_refusal from which an answer that declined is not sent back
-    guardTools: [bash, write, edit, apply_patch, web_fetch]
-    shieldTools: [web_fetch, read, bash]
+    # what each reflex reads, by what the tools do; name* names every tool that starts with name
+    guardTools: [bash, pwsh, write, edit, apply_patch, str_replace_editor, web_fetch, web_search, schedule_create, schedule_update, mcp__*]
+    guardMaxChars: 24000           # the guard reads this much of a call, whole; a longer call is asked about
+    shieldTools: [read, grep, glob, str_replace_editor, bash, pwsh, job_output, web_fetch, web_search, read_mcp_resource, mcp__*]
+    shieldMinChars: 0              # a shorter result is not screened; 0 screens every result with a word in it
+    shieldMaxChars: 60000          # the shield screens this much of a result; System Two gets none of the rest
+    maxConcurrency: 12             # System One requests at once, at least 1; a batch leaves one to the reflexes
     triage: true                   # each reflex and tool can be turned off
     guard: true
     shield: true
@@ -426,7 +494,8 @@ Every field has a default. Set any of them on the `system-one` row of a profile 
     privacy: true                  # mask personal data before System Two reads it; false turns it off
     privacyAt: 0.5                 # the lowest probability of a personal-data span that is masked
     privacyLabels: [PERSON, EMAIL_ADDRESS, PHONE_NUMBER, STREET_ADDRESS, CREDIT_CARD, IBAN_CODE, US_SSN, US_DRIVER_LICENSE, IP_ADDRESS]
-    privacyTools: [web_fetch, bash, read, pwsh, job_output, grep, web_search]
+    privacyTools: [web_fetch, bash, read, pwsh, job_output, grep, web_search, str_replace_editor]
+    pseudonymIds: true             # system_one names an id that is personal data by a stable pseudonym
     screenTool: true               # the system_one_screen tool, for computer use
     screenModel: vllm-sr/vela3-turbo
     llmProvider: vllm-sr           # the provider route of System Two's requests through the router
@@ -442,10 +511,19 @@ form they were recorded with. The tool's custom row is drawn for the default `to
 With privacy on (the default), System Two sees `[LABEL]` placeholders instead of personal data in the results of
 `privacyTools`, so it cannot copy a real value into a file it writes from what it read; it is told to ask you
 instead. Personal data marked twice over, as a name inside an email address, is masked as one, in a redacted copy too.
-A line longer than one request reads is cut after a space, so an address or a number stays whole. If the models list
-that says which model answers span questions cannot be read, privacy cannot mask: the session says so once, with the
-reason, and the list is asked again 15 seconds later. Placeholders already in a result, as in a redacted copy, are
-left as they are, and so are their bare names
+A marked value is masked again wherever it recurs as a whole word or number, never inside a longer one ("Ann" leaves
+"Annual", a card number leaves a longer order number), and in text written without spaces between words (Chinese,
+Japanese) wherever it recurs. A line longer than one request reads is cut after a space, so an address or a number
+stays whole.
+
+**When privacy cannot run.** Privacy needs the models list that says which model answers span questions. If that list
+cannot be read, privacy cannot mask, and the session goes on rather than stop: a **Privacy** card says so once, with
+the reason ("the models list could not be read (Decision API 503), so nothing was masked"), and tool results reach
+System Two unmasked until the list is read again. It is asked again 15 seconds after it failed, and privacy masks
+again by itself as soon as it answers. Privacy never holds a session up: it masks what it can, and says when it
+cannot.
+
+Placeholders already in a result, as in a redacted copy, are left as they are, and so are their bare names
 (`'CREDIT_CARD'` in a list), ids such as `m01`, sizes such as `960x540` and file paths that the span model takes for
 names, numbers or addresses. Span records keep labels
 and offsets of personal data, never the data itself. A guard or done-check model
@@ -457,6 +535,11 @@ System One key in `DECISION_API_KEY` (`apiKeyEnv`), as plugin 0.2 kept it, still
 `vllm-sr/auto` keeps working too.
 If the decision service cannot be reached, a guarded call falls back to `guardOnError` (default `allow`); the
 harness's own sandbox and approvals still apply.
+
+The plugin sends at most `maxConcurrency` requests to System One at once (12; at least 1, so 0 means 1). The
+`system_one` tool's batches use all but one of them, so the triage, the guard, the shield, privacy and the done-check
+always find a request free, and each of those reflexes' limits (`hookTimeoutMs`, 8 s) counts the time it waited for
+one: a busy client makes a reflex fail at its limit, as an unreachable service does, rather than hold the step.
 
 ## Measured
 

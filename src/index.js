@@ -21,8 +21,10 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import z from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import * as dshSession from '@deepseek-ai/dsh-session'
-import { REQUEST_TOKENS, createDecisionClient, compactAnswer, requestSlices, stateCost, yes } from './client.js'
+import { REQUEST_TOKENS, askAll, createDecisionClient, compactAnswer, requestSlices, stateCost, yes } from './client.js'
+import { GUARD_TOOLS, PRIVACY_TOOLS, SHIELD_TOOLS, onlyReads, sourceOf, toolMatcher } from './coverage.js'
 import { SERVICES, appendDotenv, describeKeys, ensureKeys, readDotenv } from './keys.js'
+import { pseudonymKeys } from './pseudonyms.js'
 import {
   DANGER_SPANS, DONE, EFFORT_LEVELS, EVIDENCE_SPANS, GUARD, HALU_SPANS, HARM_SIGNAL, PII_SPANS, REFUSAL_SIGNAL, REPLY_HARM_SIGNAL, RISK_LEVELS, SENSITIVE_LABELS, TRIAGE,
 } from './questions.js'
@@ -30,7 +32,7 @@ import { writePolicy } from './permissions.js'
 import { UI_MODES, approvalOutcome, createRecorder, failureOf, relativeTo, subject } from './records.js'
 import { holdFetch, inCall, routerHeaders, withinCall } from './router.js'
 import { SCREEN_TOOL, screenTool } from './screen.js'
-import { screen } from './shield.js'
+import { cutBefore, screen, screenable } from './shield.js'
 import { everywhere, joined } from './redact.js'
 import { excerpts, labelCounts, maskLabel, notPersonal, placeSpans, replaceSpans, toCommands, trimSpan, windows } from './spans.js'
 import { systemOneTool } from './tool.js'
@@ -38,6 +40,14 @@ import { clip, createTrace } from './trace.js'
 
 export const name = 'system-one'
 export const inject = ['tools', 'systemPrompt']
+
+// The guard reads a call whole up to guardMaxChars, in windows of GUARD_WINDOW characters, each overlapping the one
+// before it so that a command across a window's end is seen whole in the next; a longer call is asked about. The shield
+// screens SHIELD_MAX_CHARS of a result.
+const GUARD_WINDOW = 3000
+const GUARD_OVERLAP = 300
+const GUARD_MAX_CHARS = 24000
+const SHIELD_MAX_CHARS = 60000
 
 export const Config = z.object({
   baseURL: z.string().default('https://app.vllm-sr.ai'),
@@ -71,14 +81,21 @@ export const Config = z.object({
   privacyAt: z.number().default(0.5),
   // the pii preset's sensitive labels, for the privacy reflex and the system_one tool's pii questions
   privacyLabels: z.array(z.string()).default(SENSITIVE_LABELS),
-  // the tools whose results bring in text from files, shells and the web: read and grep, bash, pwsh and a background
-  // job's output, web_fetch and web_search
-  privacyTools: z.array(z.string()).default(['web_fetch', 'bash', 'read', 'pwsh', 'job_output', 'grep', 'web_search']),
+  // the tools whose results bring in text from files, shells and the web (coverage.js); `name*` names every tool that
+  // starts with name
+  privacyTools: z.array(z.string()).default(PRIVACY_TOOLS),
+  // a system_one call that looks for personal data names an item whose id is personal data (an email address) by a
+  // stable pseudonym, in its result and its redacted copy; false keeps such ids, with a warning
+  pseudonymIds: z.boolean().default(true),
 
   guard: z.boolean().default(true),
   // a span model answers the guard's questions, its signals and the dangerous part in one request
   guardModel: z.string().default('vllm-sr/vela3-turbo'),
-  guardTools: z.array(z.string()).default(['bash', 'write', 'edit', 'apply_patch', 'web_fetch']),
+  // every tool that runs a command, writes a file, sends data out, plans a prompt for later or acts through an MCP
+  // server (coverage.js)
+  guardTools: z.array(z.string()).default(GUARD_TOOLS),
+  // the guard reads a call whole up to this many characters, in overlapping windows; a longer call is asked about
+  guardMaxChars: z.number().default(GUARD_MAX_CHARS),
   guardDenyAt: z.number().default(2.5),
   guardAskAt: z.number().default(1.8),
   guardExfiltrationAt: z.number().default(0.7),
@@ -90,10 +107,14 @@ export const Config = z.object({
   guardOnError: z.union(['allow', 'ask', 'deny']).default('allow'),
 
   shield: z.boolean().default(true),
-  shieldTools: z.array(z.string()).default(['web_fetch', 'read', 'bash']),
+  // every tool whose result brings in text from files, shells, the web or an MCP server (coverage.js)
+  shieldTools: z.array(z.string()).default(SHIELD_TOOLS),
   shieldThreshold: z.number().default(0.5),
-  shieldMinChars: z.number().default(120),
-  shieldMaxChars: z.number().default(24000),
+  // a result shorter than this is not screened; 0 screens every result that has a word in it
+  shieldMinChars: z.number().default(0),
+  // the shield screens this much of a result, every passage of it; System Two gets none of the rest, only a note that
+  // says how much was withheld and how to read it in parts
+  shieldMaxChars: z.number().default(SHIELD_MAX_CHARS),
   shieldChunkChars: z.number().default(700),
 
   triage: z.boolean().default(true),
@@ -136,6 +157,9 @@ const MODELS_RETRY_MS = 15000
 // a decision that takes longer than this shows in Chat as deciding until its answer takes its place
 export const DECIDING_MS = 700
 
+// what System Two reads in place of the part of a result the shield did not screen
+const withheldNote = (screened, left) => `[System One shield: withheld the last ${left} characters of this result unscreened; it screens the first ${screened}. Read the rest in parts (a range of lines, a narrower search or command), so that each part is screened.]`
+
 const PROMPT = `# System One
 You are System Two: you plan, reason and act. Beside you runs System One, a fast decision model that answers typed questions with calibrated probabilities in a fraction of a second. It watches the loop:
 - It reviews risky tool calls before they run. A blocked call comes back as an error that starts with "System One blocked"; do not retry it unchanged. Find a safer way, or ask the user.
@@ -162,28 +186,89 @@ function seconds(value) {
   return Math.round(value) < 1000 ? `${Math.round(value)} ms` : `${(value / 1000).toFixed(1)} s`
 }
 
-function describeCall(exec) {
+const asText = value => (typeof value === 'string' ? value : value === undefined || value === null ? '' : JSON.stringify(value))
+
+/**
+ * A call as the guard reads it: what the tool does, the lines that say where it acts (a path, a working directory, a
+ * wider sandbox it asks for), and its body, whole: the command, the content written, the change, the patch.
+ */
+function callOf(exec) {
   const args = exec.arguments ?? {}
+  // a command that asks to run outside the sandbox says so, and why
+  const wider = [
+    ...(args.sandbox_permissions ? [`asking for sandbox permissions ${asText(args.sandbox_permissions)}`] : []),
+    ...(args.justification ? [`because "${clip(asText(args.justification), 300)}"`] : []),
+  ].join(' ')
+  const shell = what => ({ tool: `${exec.name} (run a ${what} command)${wider ? `, ${wider}` : ''}`, lines: args.workdir ? [`working directory: ${args.workdir}`] : [], label: 'command', body: asText(args.command) })
+  const change = (path, before, after, extra = []) => ({ lines: [`path: ${path}`, ...extra], body: `replace:\n${asText(before)}\nwith:\n${asText(after)}` })
   switch (exec.name) {
     case 'bash':
-      return `tool: bash (run a shell command)\ncommand: ${clip(args.command, 1500)}${args.workdir ? `\nworking directory: ${args.workdir}` : ''}`
+      return shell('shell')
+    case 'pwsh':
+      return shell('PowerShell')
     case 'write':
-      return `tool: write (create or replace a file)\npath: ${args.file_path}\ncontent, first lines:\n${clip(args.content, 700)}`
+      return { tool: 'write (create or replace a file)', lines: [`path: ${args.file_path}`], label: 'content', body: asText(args.content) }
     case 'edit':
-      return `tool: edit (replace text in a file)\npath: ${args.file_path}\nreplace:\n${clip(args.old_string, 350)}\nwith:\n${clip(args.new_string, 350)}`
+      return { tool: 'edit (replace text in a file)', ...change(args.file_path, args.old_string, args.new_string, args.replace_all ? ['every occurrence'] : []) }
     case 'apply_patch':
-      return `tool: apply_patch\n${clip(args.input, 1200)}`
+      return { tool: 'apply_patch', lines: [], body: asText(args.input ?? args.patch) }
+    case 'str_replace_editor':
+      if (args.command === 'create') return { tool: 'str_replace_editor create (create or replace a file)', lines: [`path: ${args.path}`], label: 'content', body: asText(args.file_text) }
+      if (args.command === 'str_replace') return { tool: 'str_replace_editor str_replace (replace text in a file)', ...change(args.path, args.old_str, args.new_str) }
+      if (args.command === 'insert') return { tool: 'str_replace_editor insert (insert text into a file)', lines: [`path: ${args.path}`, `after line: ${args.insert_line}`], label: 'content', body: asText(args.new_str) }
+      return { tool: `str_replace_editor ${asText(args.command)}`, lines: [`path: ${args.path}`], label: 'arguments', body: JSON.stringify(args) }
     case 'web_fetch':
-      return `tool: web_fetch (download a web page)\nurl: ${args.url}`
+      return { tool: 'web_fetch (download a web page)', lines: [], label: 'url', body: asText(args.url) }
+    case 'web_search':
+      return { tool: 'web_search (search the web)', lines: [], label: 'queries', body: asText(args.queries ?? args.query) }
     default:
-      return `tool: ${exec.name}\narguments: ${clip(JSON.stringify(args), 1200)}`
+      return { tool: exec.name, lines: [], label: 'arguments', body: JSON.stringify(args) }
   }
+}
+
+/**
+ * What the guard reviews of a call: its body in windows of GUARD_WINDOW characters (one for a short call), up to
+ * `maxChars`; `reviewed` of `total` characters say whether something was left out.
+ */
+export function reviewOf(exec, maxChars) {
+  const call = callOf(exec)
+  const { body } = call
+  let reviewed = Math.min(body.length, Math.max(GUARD_WINDOW, Number.isFinite(maxChars) ? maxChars : GUARD_MAX_CHARS))
+  if (reviewed < body.length && /[\uD800-\uDBFF]/.test(body[reviewed - 1])) reviewed--
+  const windows = []
+  for (let start = 0; ; start += GUARD_WINDOW - GUARD_OVERLAP) {
+    let end = Math.min(reviewed, start + GUARD_WINDOW)
+    if (end < reviewed && /[\uD800-\uDBFF]/.test(body[end - 1])) end--
+    windows.push(body.slice(start, end))
+    if (end >= reviewed) break
+  }
+  return { ...call, windows, reviewed, total: body.length }
+}
+
+/** One window of a call, as the guard's state names it: the tool (and which part), and what it runs or writes. */
+function windowParts(review, index) {
+  const n = review.windows.length
+  const left = review.total - review.reviewed
+  const tool = `${review.tool}${n > 1 ? `, part ${index + 1} of ${n}` : ''}${left > 0 && index === n - 1 ? `; ${left} more characters not shown` : ''}`
+  // a shell command alone, as the guard has always read it; any other call after the lines that say where it acts, a
+  // one-line body (an address, the arguments) on its label's line
+  const window = review.windows[index]
+  const labelled = !review.label ? window : window.includes('\n') || n > 1 ? `${review.label}:\n${window}` : `${review.label}: ${window}`
+  const command = review.label === 'command' ? window : [...review.lines, labelled].join('\n')
+  return { tool, command }
+}
+
+/** One window of a call as text, for a guard model that reads the situation as one text. */
+function describeWindow(review, index) {
+  const { tool, command } = windowParts(review, index)
+  return `tool: ${tool}\n${review.label === 'command' ? [`command: ${command}`, ...review.lines].join('\n') : command}`
 }
 
 function briefCall(exec) {
   const args = exec.arguments ?? {}
-  if (exec.name === 'bash') return clip(args.command, 200)
+  if (exec.name === 'bash' || exec.name === 'pwsh') return clip(args.command, 200)
   if (args.file_path) return args.file_path
+  if (args.path && exec.name === 'str_replace_editor') return `${args.command ?? 'edit'} ${args.path}`
   if (args.url) return args.url
   if (exec.name === 'system_one') return clip(args.file ?? (args.images ? `${args.images.length} images` : `${args.items?.length ?? 0} items`), 120)
   if (exec.name === SCREEN_TOOL) return clip(`${args.image}${args.action ? ` after "${args.action}"` : ''}`, 160)
@@ -203,11 +288,10 @@ function accountName() {
   }
 }
 
-// The call as the guard's one request names its parts: the request, the workspace, the tool and what it runs or writes.
-function callParts(exec, request, workspace) {
-  const [first, ...rest] = describeCall(exec).split('\n')
-  const command = exec.name === 'bash' ? clip(exec.arguments?.command, 1500) : rest.join('\n')
-  return { request: clip(request || '(unknown)', 1500), workspace, tool: first.replace(/^tool: /, ''), command }
+// One window of the call as the guard's one request names its parts: the request, the workspace, the tool (and which
+// part) and what it runs or writes.
+function callParts(review, index, request, workspace) {
+  return { request: clip(request || '(unknown)', 1500), workspace, ...windowParts(review, index) }
 }
 
 export function apply(ctx, config) {
@@ -388,7 +472,9 @@ export function apply(ctx, config) {
   const writePolicyOf = async exec => writePolicy({ sandboxPolicy: ctx.get('sandboxPolicy'), fs: ctx.get('fs') }, exec?.agent?.session)
 
   const OWN_TOOLS = new Set([config.toolName, SCREEN_TOOL])
-  if (config.tool) ctx.tools.register(systemOneTool({ client, trace, config, workspaceOf, writePolicyOf }))
+  // the key of the pseudonyms system_one gives item ids that are personal data: made on first use, beside the trace
+  const pseudonymKey = pseudonymKeys(join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'system-one', 'pseudonyms.key'))
+  if (config.tool) ctx.tools.register(systemOneTool({ client, trace, config, workspaceOf, writePolicyOf, pseudonymKey }))
   if (config.screenTool) ctx.tools.register(screenTool({ client, trace, config, workspaceOf, writePolicyOf }))
 
   ctx.on('agent/disposed', ({ agent }) => {
@@ -570,34 +656,40 @@ export function apply(ctx, config) {
 
   // Guard: every side-effecting call is reviewed before it runs.
   if (config.guard) {
-    const gated = new Set(config.guardTools)
+    const gated = toolMatcher(config.guardTools)
     ctx.on('tools/pre-execute', async (exec, next) => {
-      if (!gated.has(exec.name) || !exec.agent) return next()
+      if (!gated(exec.name) || !exec.agent || onlyReads(exec)) return next()
       const state = sessionState(exec.agent)
       const workspace = await workspaceOf(exec)
-      const situation = [
+      // the whole call, in windows; what lies beyond guardMaxChars is not reviewed, and the call is asked about
+      const review = reviewOf(exec, config.guardMaxChars)
+      const clipped = review.reviewed < review.total
+      const situation = index => [
         `The user asked the agent:\n"""${clip(state?.user || '(unknown)', 1500)}"""`,
         `Workspace: ${workspace}`,
-        `The agent now wants to run:\n${describeCall(exec)}`,
+        `The agent now wants to run:\n${describeWindow(review, index)}`,
       ].join('\n\n')
       const base = { reflex: 'guard', turn: state?.turn, step: state?.step, callId: exec.callId, tool: exec.name, call: subject(relativeTo(briefCall(exec), workspace, homedir())) }
       const decision = deciding(exec.agent.session, base)
       // A span model takes the questions, the dangerous part and the router's harm signals in one request: p_harm over
       // the call's parts, r_harm over the request and the call as a user turn and its answer. Another model takes the
       // questions over the text, and the span model, if any, marks the dangerous part of a flagged call afterwards.
+      // Each later window of a long call is asked how risky it is and whether it leaks secrets: the worst one decides.
       const one = await spanAnswers(config.guardModel)
-      const parts = callParts(exec, state?.user, workspace)
+      const parts = review.windows.map((_, index) => callParts(review, index, state?.user, workspace))
       const marks = one && config.guardSpans && config.spans !== 'off'
       const signals = one && config.signals
-      const inputs = one
+      const later = { risk: GUARD.risk, exfiltration: GUARD.exfiltration }
+      const entries = one
         ? [
-            { state: parts, questions: { ...GUARD, ...(marks ? DANGER_SPANS : {}), ...(signals ? HARM_SIGNAL : {}) } },
-            ...(signals ? [{ state: { user: parts.request, answer: parts.command }, questions: REPLY_HARM_SIGNAL }] : []),
+            { state: parts[0], questions: { ...GUARD, ...(marks ? DANGER_SPANS : {}), ...(signals ? HARM_SIGNAL : {}) }, window: 0 },
+            ...(signals ? [{ state: { user: parts[0].request, answer: parts[0].command }, questions: REPLY_HARM_SIGNAL }] : []),
+            ...parts.slice(1).map((state, offset) => ({ state, questions: { ...later, ...(marks ? DANGER_SPANS : {}) }, window: offset + 1 })),
           ]
-        : [{ state: situation }]
+        : parts.map((_, index) => ({ state: situation(index), questions: index === 0 ? GUARD : later, window: index }))
       let response
       try {
-        response = await client.ask({ model: config.guardModel, questions: GUARD, inputs, signal: exec.signal, timeoutMs: config.hookTimeoutMs, retries: config.hookRetries })
+        response = await askAll(client, entries, { model: config.guardModel, signal: exec.signal, timeoutMs: config.hookTimeoutMs, retries: config.hookRetries })
       } catch (error) {
         trace({ ev: 's1', reflex: 'guard', session: state?.id, tool: exec.name, call: briefCall(exec), error: String(error?.message ?? error) })
         if (!exec.signal?.aborted) {
@@ -608,8 +700,15 @@ export function apply(ctx, config) {
         if (config.guardOnError === 'ask') return { kind: 'ask', reason: 'System One is unavailable', displayReason: { en: 'System One is unavailable: allow this call?' } }
         return next()
       }
-      // the second entry's answers (r_harm) join the first's; their ids differ
-      const answers = Object.assign({}, ...response.answers)
+      // the r_harm entry's answers join the first window's (their ids differ); a later window's risk and leak answers
+      // take the first's place when they are worse
+      const windowed = entries.map((entry, index) => ({ entry, answers: response.answers[index] ?? {}, spans: response.spans[index] ?? {} }))
+      const answers = Object.assign({}, ...windowed.filter(({ entry }) => !entry.window).map(({ answers: given }) => given))
+      for (const { entry, answers: given } of windowed) {
+        if (!entry.window) continue
+        if (typeof given.risk?.score === 'number' && !(answers.risk?.score >= given.risk.score)) answers.risk = given.risk
+        if (yes(given.exfiltration) !== undefined && !(yes(answers.exfiltration) >= yes(given.exfiltration))) answers.exfiltration = given.exfiltration
+      }
       const risk = answers.risk?.score
       const exfiltration = yes(answers.exfiltration)
       const onTask = yes(answers.on_task)
@@ -617,7 +716,8 @@ export function apply(ctx, config) {
       const unsafe = answers.p_harm?.probabilities?.unsafe
       const riskLabel = typeof risk === 'number' ? RISK_LEVELS[Math.min(3, Math.round(risk))] : '?'
       const riskP = answers.risk?.probabilities?.[String(Math.min(3, Math.round(risk ?? 0)))]
-      const facts = `risk ${riskLabel} (${risk?.toFixed(2) ?? '?'} of 3${riskP !== undefined ? `, p ${riskP.toFixed(2)}` : ''}) · leaks secrets ${exfiltration?.toFixed(2) ?? '?'} · on task ${onTask?.toFixed(2) ?? '?'}${harm !== undefined ? ` · harmful ${harm.toFixed(2)}` : ''}`
+      const unread = clipped ? ` · reviewed ${review.reviewed} of ${review.total} characters` : ''
+      const facts = `risk ${riskLabel} (${risk?.toFixed(2) ?? '?'} of 3${riskP !== undefined ? `, p ${riskP.toFixed(2)}` : ''}) · leaks secrets ${exfiltration?.toFixed(2) ?? '?'} · on task ${onTask?.toFixed(2) ?? '?'}${harm !== undefined ? ` · harmful ${harm.toFixed(2)}` : ''}${unread}`
       let verdict = 'allow'
       let why = ''
       if (exfiltration !== undefined && exfiltration >= config.guardExfiltrationAt) {
@@ -639,37 +739,55 @@ export function apply(ctx, config) {
         verdict = 'deny'
         why = `${why}, and both of the router's harm checks call it harmful`
       }
+      // A call longer than the guard reads is never allowed unasked: its unread end could do anything.
+      const unreviewed = clipped && verdict === 'allow'
+      if (unreviewed) {
+        verdict = config.guardAskMode === 'deny' ? 'deny' : 'ask'
+        why = `System One reviewed only the first ${review.reviewed} of its ${review.total} characters`
+      }
       // A flagged call: which part of it does the damage, so the card and the question can point at it.
       let danger
       const place = (spans, command, model, took) => ({
         model, ms: took, spans: toCommands(command, placeSpans(spans, command, { min: 0.5 })).map(span => ({ label: span.label, text: subject(relativeTo(span.text, workspace, homedir()), 120), probability: round3(span.probability) })),
       })
+      // the riskiest window, where the guard looks for the dangerous part when its model marks none itself
+      const worst = parts.reduce((best, _, index) => {
+        const score = windowed.find(({ entry }) => entry.window === index)?.answers.risk?.score ?? -1
+        return score > best.score ? { index, score } : best
+      }, { index: 0, score: -Infinity }).index
       if (verdict !== 'allow' && marks) {
-        danger = place(response.spans[0]?.dangerous, parts.command, response.model)
+        const found = windowed.filter(({ entry }) => entry.window !== undefined).map(({ entry, spans }) => place(spans.dangerous, parts[entry.window].command, response.model))
+        const seen = new Set()
+        danger = { model: response.model, spans: found.flatMap(entry => entry.spans).filter(span => !seen.has(span.text) && seen.add(span.text)).slice(0, 4) }
       } else if (verdict !== 'allow' && !one && config.guardSpans && (await spansOn())) {
-        const command = briefCall(exec)
+        const command = parts[worst].command
         const started = performance.now()
         try {
-          const answer = await client.ask({ model: config.spanModel, questions: DANGER_SPANS, inputs: [{ state: { request: parts.request, command } }], signal: exec.signal, timeoutMs: config.hookTimeoutMs, retries: config.hookRetries })
+          const answer = await client.ask({ model: config.spanModel, questions: DANGER_SPANS, inputs: [{ state: { request: parts[worst].request, command } }], signal: exec.signal, timeoutMs: config.hookTimeoutMs, retries: config.hookRetries })
           danger = place(answer.spans[0]?.dangerous, command, answer.model, performance.now() - started)
         } catch (error) {
           trace({ ev: 's1', reflex: 'guard', session: state?.id, tool: exec.name, spans: 'error', error: String(error?.message ?? error) })
         }
       }
       const pointed = danger?.spans.length ? ` · the dangerous part: ${danger.spans.map(span => `"${span.text}"`).join(', ')}` : ''
+      // a long call's record says how much of it the guard read, in how many windows
+      const read = review.windows.length > 1 || clipped ? { windows: review.windows.length, reviewed: review.reviewed, chars: review.total } : {}
       trace({
         ev: 's1', reflex: 'guard', session: state?.id, turn: state?.turn, tool: exec.name, call: briefCall(exec), model: response.model,
-        ms: ms(response.ms), verdict, why, answers: answersOf(answers), ...(danger ? { spanModel: danger.model, danger: danger.spans } : {}),
+        ms: ms(response.ms), verdict, why, answers: answersOf(answers), ...read, ...(danger ? { spanModel: danger.model, danger: danger.spans } : {}),
       })
       decision.answer({
-        model: response.model, ms: ms(response.ms), requestId: response.requestId, answers: answersOf(answers), verdict, why,
+        model: response.model, ms: ms(response.ms), requestId: response.requestId, answers: answersOf(answers), verdict, why, ...read,
         ...(danger ? { spanModel: danger.model, ...(danger.ms === undefined ? {} : { spanMs: ms(danger.ms) }), danger: danger.spans } : {}),
       })
       if (verdict === 'ask') state?.asked.set(exec.callId, base)
       if (verdict === 'deny') {
+        const advice = unreviewed
+          ? `Split it into calls of at most ${review.reviewed} characters each, so that System One can review each one whole, or ask the user to confirm.`
+          : 'Do not retry it unchanged. Reach the user\'s goal a safer way, or ask the user to confirm.'
         return {
           kind: 'deny',
-          reason: `System One blocked this call (${response.model}, ${seconds(response.ms)}) because ${why}: ${facts}${pointed}. Do not retry it unchanged. Reach the user's goal a safer way, or ask the user to confirm.`,
+          reason: `System One blocked this call (${response.model}, ${seconds(response.ms)}) because ${why}: ${facts}${pointed}. ${advice}`,
           info: { name: 'SystemOneGuard', code: 'S1_BLOCKED', reason: `${why}: ${facts}${pointed}` },
         }
       }
@@ -686,8 +804,8 @@ export function apply(ctx, config) {
 
   // Shield and privacy, on tool results that bring outside text in. The shield screens it passage by passage and
   // removes what gives the agent orders; privacy (a span model) masks personal data before System Two reads it.
-  const shielded = new Set(config.shield ? config.shieldTools : [])
-  const masked = new Set(config.privacy ? config.privacyTools : [])
+  const shielded = toolMatcher(config.shield ? config.shieldTools : [])
+  const masked = toolMatcher(config.privacy ? config.privacyTools : [])
   const sensitive = new Set(config.privacyLabels ?? [])
   // Not the personal data privacy keeps from System Two: the machine's own account and host names (they fill file
   // listings and paths), loopback and private network addresses, and what the user wrote in the request itself.
@@ -704,10 +822,10 @@ export function apply(ctx, config) {
     if (span.label === 'IP_ADDRESS' && LOCAL_ADDRESS.test(value.replace(/^[a-z]+:\/\//i, '').replace(/\/.*$/, ''))) return false
     return !(value.length >= 3 && told?.includes(value))
   }
-  if (shielded.size || masked.size) {
+  if ((config.shield && config.shieldTools?.length) || (config.privacy && config.privacyTools?.length)) {
     ctx.on('tools/post-execute', async (exec, result, next) => {
-      const screens = shielded.has(exec.name)
-      const masks = masked.has(exec.name)
+      const screens = shielded(exec.name)
+      const masks = masked(exec.name)
       if ((!screens && !masks) || !exec.agent || result.isError) return next()
       const full = textOf(result.content)
       if (!full) return next()
@@ -717,10 +835,10 @@ export function apply(ctx, config) {
       const head = envelope ? envelope[1] : ''
       const foot = envelope?.[3] ?? ''
       const text = envelope ? envelope[2] : full
-      const screened = text.slice(0, config.shieldMaxChars)
+      // the shield screens shieldMaxChars of a result, every passage of it; System Two gets none of the rest
+      const screened = screens ? text.slice(0, cutBefore(text, Number.isFinite(config.shieldMaxChars) ? Math.max(1, config.shieldMaxChars) : SHIELD_MAX_CHARS)) : text
       const tail = text.slice(screened.length)
-      const where = exec.name === 'web_fetch' ? `a web page (${exec.arguments?.url})` : exec.name === 'read' ? `the file ${exec.arguments?.file_path}` : `the output of: ${clip(exec.arguments?.command, 200)}`
-      const about = `The user asked the agent: "${clip(state?.user || '(unknown)', 300)}"\nThe agent just read this passage from ${where}:`
+      const about = `The user asked the agent: "${clip(state?.user || '(unknown)', 300)}"\nThe agent just read this passage from ${sourceOf(exec)}:`
       const call = subject(relativeTo(briefCall(exec), await workspaceOf(exec), homedir()))
       const target = { turn: state?.turn, step: state?.step, callId: exec.callId, tool: exec.name, call }
       const spans = await spansOn()
@@ -728,7 +846,7 @@ export function apply(ctx, config) {
       let verdict
       let elapsed
       let shielding
-      if (screens && full.length >= config.shieldMinChars) {
+      if (screens && full.length >= config.shieldMinChars && screenable(screened)) {
         shielding = deciding(exec.agent.session, { reflex: 'shield', ...target })
         const started = performance.now()
         try {
@@ -745,11 +863,14 @@ export function apply(ctx, config) {
         elapsed = performance.now() - started
         shielding.hold()
       }
+      // what lies past the screened part is withheld once the shield has screened the rest; a shield that failed passes
+      // the result on as it is, and says so
+      const withheld = verdict && tail.length > 0 ? { withheld: tail.length, screenedChars: screened.length } : undefined
       if (verdict) {
         trace({
           ev: 's1', reflex: 'shield', session: state?.id, turn: state?.turn, tool: exec.name, call: briefCall(exec), model: verdict.model, ms: ms(elapsed),
-          passages: verdict.passages, verdict: verdict.removedLines || verdict.removedSpans ? 'removed' : 'clean', removedLines: verdict.removedLines,
-          removedSpans: verdict.removedSpans, spanModel: verdict.spanModel,
+          passages: verdict.passages, verdict: verdict.removedLines || verdict.removedSpans ? 'removed' : withheld ? 'withheld' : 'clean', removedLines: verdict.removedLines,
+          removedSpans: verdict.removedSpans, spanModel: verdict.spanModel, ...withheld,
           flagged: verdict.flagged.map(entry => ({ p: round3(entry.p), text: clip(entry.text, 400), lines: entry.lines.map(line => ({ p: round3(line.p), text: line.text })), spans: entry.spans })),
         })
       }
@@ -763,11 +884,11 @@ export function apply(ctx, config) {
       const removed = verdict && (verdict.removedLines > 0 || verdict.removedSpans > 0)
       if (verdict) {
         // A later handler that blocks the result keeps the whole passage from the model, so the injection was found, not removed.
-        const outcome = !removed ? 'clean' : downstream.kind === 'block' ? 'flagged' : 'removed'
+        const outcome = !removed ? (withheld ? 'withheld' : 'clean') : downstream.kind === 'block' ? 'flagged' : 'removed'
         const shown = verdict.flagged.flatMap(entry => entry.excerpts).slice(0, 2)
         shielding.answer({
           model: verdict.model, ms: ms(elapsed), passages: verdict.passages, flagged: verdict.flagged.length,
-          removedLines: verdict.removedLines, maxP: round3(verdict.maxP), verdict: outcome,
+          removedLines: verdict.removedLines, maxP: round3(verdict.maxP), verdict: outcome, ...withheld,
           ...(verdict.spanModel ? { spanModel: verdict.spanModel, spanMs: ms(verdict.spanMs) } : {}),
           ...(verdict.removedSpans ? { removedSpans: verdict.removedSpans, removedChars: verdict.removedChars, excerpts: shown } : {}),
         })
@@ -775,7 +896,8 @@ export function apply(ctx, config) {
       if (downstream.kind === 'block') return downstream
 
       // Privacy: personal data in what System Two is about to read becomes its label, as [EMAIL_ADDRESS].
-      const body = (removed ? verdict.text : screened) + tail
+      const kept = removed ? verdict.text : screened
+      const body = withheld ? `${kept}${kept.endsWith('\n') ? '' : '\n'}${withheldNote(screened.length, tail.length)}` : kept + tail
       let privacy
       if (masks && !spans && state && !state.privacyOff) {
         // asked for, but no span model answers: said once until privacy works again, so nobody believes the data was masked
@@ -820,7 +942,7 @@ export function apply(ctx, config) {
           ? { model: privacy.model, ms: ms(privacy.ms), verdict: 'masked', masked: hidden.length, labels, excerpts: excerpts(body, cuts, { hide: true, around: 40, max: 3 }) }
           : { model: privacy.model, ms: ms(privacy.ms), verdict: 'clean', masked: 0 })
       }
-      if (!removed && hidden.length === 0) return downstream
+      if (!removed && hidden.length === 0 && !withheld) return downstream
 
       const banners = []
       const notices = []
@@ -838,7 +960,7 @@ export function apply(ctx, config) {
       }
       return {
         kind: 'accept',
-        content: [{ type: 'text', text: `${banners.join('\n')}\n\n${head}${hidden.length ? replaceSpans(body, cuts, maskLabel) : body}${foot}` }],
+        content: [{ type: 'text', text: `${banners.length ? `${banners.join('\n')}\n\n` : ''}${head}${hidden.length ? replaceSpans(body, cuts, maskLabel) : body}${foot}` }],
         additionalContexts: [...(downstream.additionalContexts ?? []), ...notices],
       }
     })
@@ -942,7 +1064,7 @@ export function apply(ctx, config) {
       const waiting = yes(answers.waiting)
       const refusal = answers.r_refusal?.probabilities?.refusal
       const unfinished = complete !== undefined && complete < config.doneCompleteBelow
-      const unchecked = checked !== undefined && checked < 0.3 && state.calls.some(call => ['write', 'edit', 'apply_patch'].includes(call.tool))
+      const unchecked = checked !== undefined && checked < 0.3 && state.calls.some(call => ['write', 'edit', 'apply_patch', 'str_replace_editor'].includes(call.tool))
       const halu = one && weighsClaims
         ? { model: response.model, ms: response.ms, spans: placeSpans(response.spans[0]?.halu, answered, { min: config.doneHaluAt }), backed: backing(response.spans[0]?.evidence, context) }
         : haluTask ? await haluTask : undefined

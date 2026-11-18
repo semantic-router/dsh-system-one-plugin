@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
 import http from 'node:http'
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
+import { link, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { registerHooks } from 'node:module'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { test } from 'node:test'
+import { deflateSync } from 'node:zlib'
 import { createDecisionClient } from '../src/client.js'
-import { loadItems } from '../src/items.js'
+import { loadItems, parseCsv } from '../src/items.js'
 import { RED, decodePng, encodePng } from '../src/png.js'
 import { ROUTER_SIGNALS } from '../src/questions.js'
 import { redactItem, writeRedacted } from '../src/redact.js'
@@ -111,6 +112,12 @@ function fakeDecisions() {
         const inputs = body.states === undefined ? [body] : Object.values(body.states)
         // each request as its first input reads, with all of its inputs
         asked.push({ model: body.model, ...inputs[0], inputs })
+        // an input that says so is refused, with its whole request: as invalid (400), or for its key (401)
+        const refused = inputs.map(input => JSON.stringify(input.state).match(/REFUSE-(400|401)/)?.[1]).find(Boolean)
+        if (refused) {
+          response.writeHead(Number(refused), { 'content-type': 'application/json' })
+          return response.end(JSON.stringify({ error: refused === '400' ? { code: 'invalid_request', message: 'the request holds a state it cannot read' } : { code: 'invalid_api_key', message: 'the key is not valid' } }))
+        }
         if (body.states === undefined) return response.end(JSON.stringify({ model: body.model, ...decide(body.questions, body.state, body.images) }))
         const states = Object.fromEntries(Object.entries(body.states).map(([id, input]) => [id, { model: body.model, ...decide(input.questions, input.state, input.images) }]))
         response.end(JSON.stringify({ model: body.model, states }))
@@ -120,7 +127,7 @@ function fakeDecisions() {
   })
 }
 
-async function setup(t, files = {}, { writePolicyOf } = {}) {
+async function setup(t, files = {}, { writePolicyOf, maxConcurrency, pseudonymKey, ...overrides } = {}) {
   process.env.S1_TOOL_KEY = 'sk-vsr-test'
   const workspace = await mkdtemp(join(tmpdir(), 's1-tool-'))
   for (const [name, content] of Object.entries(files)) {
@@ -128,10 +135,10 @@ async function setup(t, files = {}, { writePolicyOf } = {}) {
     await writeFile(join(workspace, name), content)
   }
   const { server, url, asked, refuse } = await fakeDecisions()
-  const client = createDecisionClient({ baseURL: url, apiKeyEnv: 'S1_TOOL_KEY' })
+  const client = createDecisionClient({ baseURL: url, apiKeyEnv: 'S1_TOOL_KEY', maxConcurrency })
   const traced = []
-  const config = { toolName: 'system_one', model: 'vllm-sr/d3-ultra', spanModel: 'vllm-sr/vela3-turbo', toolMaxItems: 500, toolMaxChars: 4000, systemOneUi: 'card' }
-  const tool = systemOneTool({ client, trace: entry => traced.push(entry), config, workspaceOf: async () => workspace, writePolicyOf })
+  const config = { toolName: 'system_one', model: 'vllm-sr/d3-ultra', spanModel: 'vllm-sr/vela3-turbo', toolMaxItems: 500, toolMaxChars: 4000, systemOneUi: 'card', ...overrides }
+  const tool = systemOneTool({ client, trace: entry => traced.push(entry), config, workspaceOf: async () => workspace, writePolicyOf, ...(pseudonymKey ? { pseudonymKey } : {}) })
   t.after(async () => {
     client.close()
     server.close()
@@ -444,7 +451,7 @@ test('box questions over images: annotated PNG copies with the boxes found, and 
   assert.equal(asked.length, 3)
   assert.ok(asked.every(body => body.model === 'vllm-sr/d3-ultra' && body.images.length === 1))
   assert.equal(value.output, join(workspace, 'screens.s1.jsonl'))
-  assert.deepEqual(value.annotated, { dir: join(workspace, 'annotated'), files: ['annotated/a.png'], skipped: ['screens/c.jpg'] })
+  assert.deepEqual(value.annotated, { dir: join(workspace, 'annotated'), files: ['annotated/a.png'], skipped: ['screens/c.jpg (not a PNG)'] })
   assert.equal(value.summary.problem.found, 2)
 
   // the outline sits just outside the box, and what it marks is left as it was
@@ -460,7 +467,7 @@ test('box questions over images: annotated PNG copies with the boxes found, and 
     ['c.jpg', join(workspace, 'screens/c.jpg'), ['problem'], ['broken']],
   ])
   assert.deepEqual(value.images[0].boxes[0], { id: 'problem', box: { left: 0.25, top: 0.25, right: 0.5, bottom: 0.5 }, confidence: 0.92 })
-  assert.match(rendered(value), /Annotated copies \(boxes in red\): annotated\/a\.png; not drawn \(not PNG\): screens\/c\.jpg/)
+  assert.match(rendered(value), /Annotated copies \(boxes in red\): annotated\/a\.png; not drawn on, their boxes are in the results: screens\/c\.jpg \(not a PNG\)/)
 
   // drawn beside the image itself, a copy does not replace it
   const beside = await run({ questions: { problem: { type: 'box', instructions: 'The error message' } }, images: ['screens/a.png'], annotate: 'screens' })
@@ -792,4 +799,164 @@ test('in a workspace-write session the system_one tool writes inside the workspa
     await assert.rejects(run({ questions: TEAM, file: 'tickets.jsonl', output: 'elsewhere/rows.jsonl' }), /^Error: output elsewhere\/rows\.jsonl is outside this session's workspace/)
     assert.deepEqual(await readdir(outside), ['tickets.jsonl'])
   }
+})
+
+const BROKEN = { broken: { type: 'noul', instructions: 'Does it report something broken?' } }
+
+test('a request that fails costs only its own items: the others keep their answers, and System One unavailable stops the rest', async t => {
+  const { workspace, run, rendered } = await setup(t)
+  // twenty short items, nine to a request; the second request is refused as invalid
+  const items = Array.from({ length: 20 }, (_, i) => (i === 12 ? 'REFUSE-400 this one' : `ticket ${i + 1}: the export fails`))
+  const value = await run({ questions: BROKEN, items, output: 'rows.jsonl' })
+  assert.deepEqual([value.summary.broken.yes, value.summary.broken.failed, value.partial], [11, 9, { failed: 1, requests: 3, items: 9 }])
+  assert.match(rendered(value), /Notes: 1 of 3 requests failed \(Decision API 400 invalid_request: the request holds a state it cannot read\): 9 item\(s\) have an error in place of their answers; call again for them\./)
+  const rows = await readRows(join(workspace, 'rows.jsonl'))
+  assert.equal(rows.length, 20)
+  assert.deepEqual([rows[0].answers.broken.yes, rows[12].answers.broken.error, rows[19].answers.broken.yes], [0.9, 'request_failed', 0.9])
+
+  // a key System One refuses: the requests still waiting are not sent, and their items say so
+  const { asked, run: runOne } = await setup(t, {}, { maxConcurrency: 2 })
+  const one = await runOne({ questions: BROKEN, items: items.map((item, i) => (i === 12 ? 'REFUSE-401 this one' : item)) })
+  assert.equal(asked.length, 2, 'the third request was never sent')
+  assert.deepEqual([one.summary.broken.yes, one.summary.broken.failed, one.partial], [9, 11, { failed: 2, requests: 3, items: 11 }])
+  // every request refused: System One is unavailable, and System Two is told to go on without it
+  await assert.rejects(runOne({ questions: BROKEN, items: ['REFUSE-401 a', 'b'] }), /^Error: System One is unavailable: it has no valid key/)
+})
+
+test('a redacted copy is written whole or not at all: an item its request could not mark keeps no copy, and no text in the results', async t => {
+  const { workspace, run } = await setup(t)
+  const items = Array.from({ length: 12 }, (_, i) => (i === 10 ? 'REFUSE-400 Dana Ruiz' : `note ${i + 1} from Dana Ruiz`))
+  const value = await run({ questions: { personal: { preset: 'pii' } }, items, redact: true, output: 'rows.jsonl' })
+  assert.equal(value.redacted, undefined)
+  assert.match(value.notes.join('\n'), /no redacted copy: 3 item\(s\) were not marked \(request_failed: Decision API 400 invalid_request: [^)]*\), and a copy would keep what they hold; call again/)
+  await assert.rejects(readFile(join(workspace, 'system-one-redacted.txt')))
+  const rows = await readRows(join(workspace, 'rows.jsonl'))
+  assert.deepEqual([rows[0].text, rows[10].text], ['note 1 from [PERSON]', undefined])
+})
+
+// a PNG's header as the annotator reads it, over pixels that do not compress
+function pngWith({ width, height, depth, color, interlace = 0 }) {
+  const chunk = (type, body) => {
+    const out = Buffer.alloc(12 + body.length)
+    out.writeUInt32BE(body.length, 0)
+    out.write(type, 4, 'latin1')
+    body.copy(out, 8)
+    return out
+  }
+  const header = Buffer.alloc(13)
+  header.writeUInt32BE(width, 0)
+  header.writeUInt32BE(height, 4)
+  header[8] = depth
+  header[9] = color
+  header[12] = interlace
+  const channels = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 }[color]
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', header),
+    ...(color === 3 ? [chunk('PLTE', randomBytes(48))] : []),
+    chunk('IDAT', deflateSync(randomBytes(height * (1 + Math.ceil((width * channels * depth) / 8))))), chunk('IEND', Buffer.alloc(0)),
+  ])
+}
+
+test('an image the annotator cannot draw on is left out with why, after the results are written, and the others are drawn', async t => {
+  const noise = { width: 40, height: 30, data: randomBytes(40 * 30 * 4) }
+  const { workspace, run, rendered } = await setup(t, {
+    'charts/a.png': encodePng(noise),
+    'charts/deep.png': pngWith({ width: 40, height: 30, depth: 16, color: 2 }),
+    'charts/laced.png': pngWith({ width: 40, height: 30, depth: 8, color: 6, interlace: 1 }),
+    'charts/few.png': pngWith({ width: 40, height: 30, depth: 4, color: 3 }),
+  })
+  const images = ['charts/a.png', 'charts/deep.png', 'charts/laced.png', 'charts/few.png']
+  const value = await run({ questions: { spike: { type: 'box', instructions: 'the spike in the line' } }, images, annotate: 'marked' })
+  assert.deepEqual(value.annotated.files, ['marked/a.png'])
+  assert.deepEqual(value.annotated.skipped, ['charts/deep.png (a 16-bit RGB PNG)', 'charts/laced.png (an interlaced PNG)', 'charts/few.png (a 4-bit palette PNG)'])
+  assert.match(rendered(value), /not drawn on, their boxes are in the results: charts\/deep\.png \(a 16-bit RGB PNG\), charts\/laced\.png/)
+  const rows = await readRows(value.output)
+  assert.equal(rows.length, 4)
+  assert.ok(rows.every(row => row.answers.spike.box))
+  assert.deepEqual(await readdir(join(workspace, 'marked')), ['a.png'])
+})
+
+test('nothing a call writes lands on a file it reads: another letter case, a link, a hard link, an image or a source given as output', async t => {
+  const noise = { width: 40, height: 30, data: randomBytes(40 * 30 * 4) }
+  const { workspace, asked, run } = await setup(t, { ...TICKETS, 'shots/a.png': encodePng(noise), 'other/a.png': encodePng(noise), 'draft.md': 'Exports use Parquet.\n', 'policy.md': '- exports: Parquet\n' })
+  const box = { where: { type: 'box', instructions: 'the error message' } }
+  await assert.rejects(run({ questions: box, images: ['shots/a.png'], output: 'shots/a.png' }), /^Error: output is where the results go: give it a path other than the image shots\/a\.png$/)
+  // one file on Windows and macOS, refused everywhere
+  await assert.rejects(run({ questions: TEAM, file: 'tickets.jsonl', output: 'Tickets.jsonl' }), /give it a path other than the input file \(Tickets\.jsonl is that file under another name\)/)
+  await symlink(join(workspace, 'tickets.jsonl'), join(workspace, 'link.jsonl'))
+  await assert.rejects(run({ questions: TEAM, file: 'tickets.jsonl', redact: 'link.jsonl' }), /^Error: redact writes a copy: give it a path other than the input file \(link\.jsonl is that file under another name\)$/)
+  await link(join(workspace, 'tickets.jsonl'), join(workspace, 'hard.jsonl'))
+  await assert.rejects(run({ questions: TEAM, file: 'tickets.jsonl', output: 'hard.jsonl' }), /give it a path other than the input file \(hard\.jsonl is that file under another name\)/)
+  await assert.rejects(run({ questions: { unsupported: { preset: 'halu' } }, file: 'draft.md', sources: ['policy.md'], output: 'policy.md' }), /give it a path other than the source policy\.md/)
+  assert.equal(asked.length, 0, 'refused before System One is asked')
+  assert.equal(await readFile(join(workspace, 'tickets.jsonl'), 'utf8'), TICKETS['tickets.jsonl'])
+
+  // an annotated copy that would land on another image, or on its own, goes beside its own image
+  const drawn = await run({ questions: box, images: ['shots/a.png', 'other/a.png'], annotate: 'shots' })
+  assert.deepEqual(drawn.annotated.files.sort(), ['other/a.annotated.png', 'shots/a.annotated.png'])
+  for (const path of ['shots/a.png', 'other/a.png']) assert.deepEqual(decodePng(await readFile(join(workspace, path))).data, noise.data)
+})
+
+test('a call that looks for personal data names an id that is personal data by a stable pseudonym; the results file keeps both', async t => {
+  const records = [
+    { id: 'dana.ruiz@northwind.example', subject: 'Refund', body: 'I am Dana Ruiz, please refund my order!' },
+    { id: 'T-2', subject: 'Invite', body: 'How do I invite a teammate?' },
+  ]
+  const tickets = { 'tickets.jsonl': records.map(record => `${JSON.stringify(record)}\n`).join('') }
+  const { workspace, run, rendered } = await setup(t, tickets)
+  const value = await run({ questions: { personal: { preset: 'pii' }, team: TEAM.team }, file: 'tickets.jsonl', redact: true })
+  const [alias] = JSON.stringify(value).match(/EMAIL_ADDRESS-[0-9a-f]{10}/)
+  assert.ok(!JSON.stringify(value).includes('dana.ruiz@'), 'nothing System Two reads holds the id')
+  assert.ok(!rendered(value).includes('dana.ruiz@'))
+  assert.match(rendered(value), new RegExp(`Notes: 1 item id\\(s\\) are personal data \\(EMAIL_ADDRESS 1\\): this result and the redacted copy name them by pseudonyms, as ${alias}, the same for the same id in every call; the results file keeps each id beside its pseudonym\\.`))
+  assert.deepEqual(value.pseudonyms, { items: 1, labels: { EMAIL_ADDRESS: 1 }, named: 'pseudonyms' })
+  assert.deepEqual(value.preview.map(row => row.id), [alias, 'T-2'])
+  const copy = (await readFile(join(workspace, 'tickets.redacted.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+  assert.deepEqual(copy[0], { id: alias, subject: 'Refund', body: 'I am [PERSON], please refund my order!' })
+  assert.deepEqual(copy[1], records[1])
+  const rows = await readRows(join(workspace, 'tickets.s1.jsonl'))
+  assert.deepEqual([rows[0].id, rows[0].pseudonym, rows[1].id, rows[1].pseudonym], ['dana.ruiz@northwind.example', alias, 'T-2', undefined])
+
+  // the same id gets the same pseudonym again, also from its shape when the span model never read it
+  const again = await run({ questions: { personal: { preset: 'pii' } }, file: 'tickets.jsonl', text_field: 'body', output: 'again.csv' })
+  assert.equal(again.preview[0].id, alias)
+  const csv = (await readFile(join(workspace, 'again.csv'), 'utf8')).split('\n')
+  assert.equal(csv[0], 'id,pseudonym,personal,personal_labels')
+  assert.ok(csv[1].startsWith(`dana.ruiz@northwind.example,${alias},`))
+  // a call that does not look for personal data shows ids as they are
+  assert.equal((await run({ questions: TEAM, file: 'tickets.jsonl' })).preview[0].id, 'dana.ruiz@northwind.example')
+
+  // with pseudonymIds off the ids stay, and the result says so
+  const kept = await setup(t, tickets, { pseudonymIds: false })
+  const plain = await kept.run({ questions: { personal: { preset: 'pii' } }, file: 'tickets.jsonl', redact: true })
+  assert.deepEqual([plain.preview[0].id, plain.pseudonyms.named], ['dana.ruiz@northwind.example', 'kept'])
+  assert.match(plain.notes.join('\n'), /1 item id\(s\) are personal data \(EMAIL_ADDRESS 1\), and they are kept as they are in this result, the results file and the redacted copy \(pseudonymIds is off\)/)
+})
+
+test('a CSV of results escapes its header cells as it does every cell: commas, quotes and line breaks keep their columns', async t => {
+  const { workspace, run } = await setup(t)
+  const questions = {
+    'urgent, really?': { type: 'noul', instructions: 'Is it urgent?' },
+    'say "why"': { type: 'choice', instructions: 'Which team?', criteria: { billing: 'invoices', support: 'the rest' } },
+    'two\nlines': { type: 'score', instructions: 'How bad?', criteria: ['low', 'high'] },
+  }
+  await run({ questions, items: ['refund my invoice!', 'hello'], output: 'rows.csv' })
+  const text = await readFile(join(workspace, 'rows.csv'), 'utf8')
+  assert.ok(text.startsWith('id,"urgent, really?_yes","say ""why""","say ""why""_confidence","two\nlines"\n'), text)
+  const rows = parseCsv(text)
+  assert.deepEqual(Object.keys(rows[0]), ['id', 'urgent, really?_yes', 'say "why"', 'say "why"_confidence', 'two\nlines'])
+  assert.deepEqual([rows[0].id, rows[0]['say "why"'], rows[1].id], ['1', 'billing', '2'])
+})
+
+test('a question named after a column every row has, or two whose answers would share a column, is refused before anything is asked', async t => {
+  const { workspace, asked, run } = await setup(t)
+  const choice = { type: 'choice', instructions: 'Which team?', criteria: { billing: 'invoices', support: 'the rest' } }
+  await assert.rejects(run({ questions: { id: choice }, items: ['x'] }), /^Error: question id "id" names the id column, which every result row has for its item: rename the question, as "id_answer"$/)
+  await assert.rejects(run({ questions: { pseudonym: { type: 'score', instructions: 'How?', criteria: ['low', 'high'] } }, items: ['x'] }), /question id "pseudonym" names the pseudonym column/)
+  await assert.rejects(run({ questions: { team: choice, team_confidence: { type: 'score', instructions: 'How sure?', criteria: ['low', 'high'] } }, items: ['x'] }),
+    /^Error: questions "team" and "team_confidence" would both write the column team_confidence of the results: rename one of them$/)
+  assert.equal(asked.length, 0)
+  // a yes/no question named id writes id_yes, beside the item's own id
+  await run({ questions: { id: { type: 'noul', instructions: 'Does it name an order id?' } }, items: ['order 88231-B'], output: 'ids.csv' })
+  assert.deepEqual(parseCsv(await readFile(join(workspace, 'ids.csv'), 'utf8')), [{ id: '1', id_yes: '0.1' }])
 })

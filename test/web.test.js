@@ -354,6 +354,45 @@ test('triage, shield and done-check cards say what System One decided', () => {
   assert.equal(nodes[1].groupTree, 'turn')
 })
 
+test('a shield card says what it withheld past what it screens, and a guard card how much of a long call it read', () => {
+  const { exports } = load()
+  const nodes = assemble(exports.definition, [
+    record({ reflex: 'shield', step: 3, callId: 'c1', tool: 'web_fetch', call: 'https://docs.example/guide', passages: 86, flagged: 0, removedLines: 0, maxP: 0.03, verdict: 'withheld', withheld: 140000, screenedChars: 60000 }),
+    record({ reflex: 'guard', step: 4, callId: 'c2', tool: 'write', call: 'data.csv', answers: guardAnswers(0.4), verdict: 'ask', why: 'System One reviewed only the first 24000 of its 32000 characters', windows: 9, reviewed: 24000, chars: 32000 }),
+  ])
+  const [shield, guard] = nodes.map(node => render(exports.SystemOneNode({ node })))
+  const [card] = findAll(shield, props => props['data-system-one'])
+  assert.deepEqual(attrs(card, ['', 'reflex', 'verdict', 'tone']), { '': 'card', reflex: 'shield', verdict: 'withheld', tone: 'warn' })
+  for (const expected of ['Rest withheld', 'Withheld', '140000 characters', 'System One screens the first 60000 characters of a result; System Two got none of the last 140000 characters, only a note to read them in parts.']) {
+    assert.ok(textOf(shield).includes(expected), `${expected} in ${textOf(shield)}`)
+  }
+  assert.ok(findAll(shield, props => props['data-system-one-fact'] === 'withheld').length === 1)
+  for (const expected of ['Asked you', 'Reviewed', '24000 of 32000 characters · 9 parts', 'Because System One reviewed only the first 24000 of its 32000 characters.']) {
+    assert.ok(textOf(guard).includes(expected), `${expected} in ${textOf(guard)}`)
+  }
+  assert.deepEqual(findAll(guard, props => props['data-system-one-fact']).map(fact => fact.props['data-system-one-fact']), ['risk', 'leaks', 'on-task', 'reviewed'])
+})
+
+test('a batch card says which ids it named by pseudonyms, which requests failed, and which images it could not draw on', () => {
+  const { exports } = load()
+  const meta = {
+    systemOne: 1, ui: 'card', model: 'vllm-sr/d3-ultra', items: 20, questions: 1, requests: 3, seconds: 1.2, output: '/work/rows.jsonl',
+    summary: { personal: { type: 'span', preset: 'pii', labels: { EMAIL_ADDRESS: 4 }, items: 4, of: 11, top: [], failed: 9 } },
+    pseudonyms: { items: 2, labels: { EMAIL_ADDRESS: 2 }, named: 'pseudonyms' },
+    partial: { failed: 1, requests: 3, items: 9 },
+    annotated: { dir: '/work/marked', files: [], skipped: ['charts/deep.png (a 16-bit RGB PNG)'] },
+  }
+  const props = { callId: 'call-9', toolName: 'system_one', cwd: '/work', openFile: () => {}, phase: 'result', block: { time: Date.now(), isError: false, content: [], meta, call: { name: 'system_one', argsRaw: '{}' } } }
+  const tree = render(exports.SystemOneToolRow(props))
+  const said = part => textOf(findAll(tree, props => props['data-system-one-part'] === part)[0])
+  assert.equal(said('pseudonyms'), '2 item ids are personal data (EMAIL_ADDRESS): System Two and the redacted copy see pseudonyms; the results file keeps each id beside its pseudonym')
+  assert.equal(said('partial'), '1 of 3 requests failed: 9 items have an error in place of answers')
+  assert.equal(said('skipped'), 'Not drawn on: charts/deep.png (a 16-bit RGB PNG); their boxes are in the results')
+  assert.equal(said('annotated'), 'No annotated copy')
+  const kept = render(exports.SystemOneToolRow({ ...props, block: { ...props.block, meta: { ...meta, pseudonyms: { ...meta.pseudonyms, named: 'kept' } } } }))
+  assert.match(textOf(findAll(kept, props => props['data-system-one-part'] === 'pseudonyms')[0]), /kept as they are, as pseudonymIds is off$/)
+})
+
 test('a routine check is one line, compact mode makes every card one line, and an unreachable service says so', () => {
   const { exports } = load()
   const [routine] = assemble(exports.definition, [
