@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.9.0 (2026-11-19)
+
+The reflexes read every tool that brings text in or acts, and all of what they read; the `system_one` tool never
+writes over what it reads and keeps personal data out of ids; and Chat says where something was held back.
+
+- **Shield reads every tool that brings text in, and all of it.** It screened only `web_fetch`, `read` and `bash`
+  results, only their first 24,000 characters, and passed the rest on unscreened under a clean verdict; a result under
+  120 characters was never screened. The default `shieldTools` now covers tools by what they return: files' text
+  (`read`, `grep`, `glob`, `str_replace_editor`), shells' (`bash`, Windows' `pwsh`, a background job's `job_output`),
+  the web's (`web_fetch`, `web_search`) and an MCP server's (`read_mcp_resource` and every `mcp__*` tool). In every
+  tool list a name that ends in `*` now stands for every tool that starts with the rest. Every result with a word in
+  it is screened, however short, and every passage of its first 60,000 characters (`shieldMaxChars`); System Two gets
+  none of the rest, only a note that says how much was withheld and asks it to read the rest in parts, and the card
+  says **Rest withheld**.
+- **Shield's sentences end where they end.** A sentence ended only at `.`, `!` or `?` before a space, or at a blank
+  line, so a Chinese or Japanese paragraph was removed whole, and a line without final punctuation, such as a README's
+  test command, went with the injected line under it. Sentences now also end at `。`, `！` and `？` and at every line
+  break.
+- **Guard reads a call whole, and asks about one it cannot.** It read a shell command's first 1,500 characters, a
+  write's first 700, 350 of each side of an edit and 1,200 of a patch, so whatever came after was never reviewed. It
+  now reads up to 24,000 characters of a call (`guardMaxChars`), in windows of 3,000 that overlap, and the riskiest
+  window decides and names the dangerous part. A longer call is never allowed unasked: you are asked (with
+  `guardAskMode: deny`, or headless, it is denied with the advice to split it). The default `guardTools` adds Windows'
+  `pwsh`, `str_replace_editor` (but for its `view`), `web_search`, `schedule_create`, `schedule_update` and every MCP
+  tool, and a command that asks for wider sandbox permissions tells the guard so.
+- **Masking hits whole words only.** A marked value masked again wherever it recurred was found inside longer words
+  and numbers (`Annual` became `[PERSON]ual`, `1424242` became `1[CREDIT_CARD]42`); a recurrence now has to stand on
+  its own, and in Chinese and Japanese, written without spaces, it is found wherever it recurs. Privacy also masks
+  `str_replace_editor`'s view, as it masks `read`.
+- **When privacy cannot run, it says so and the session goes on.** As since 0.8.1: if the models list cannot be read,
+  one card says why, tool results reach System Two unmasked, and the list is asked again 15 seconds later. The
+  reference now says so in as many words.
+- **`system_one` never writes over what it reads.** It compared the results' path with the input's as text, so the
+  input in another letter case (one file on Windows and macOS), a link to it, or an image or a source named as
+  `output` was overwritten while the call reported success. Every file it writes is compared with every file it reads
+  by file identity before anything is asked, and an annotated copy that would land on an image goes beside its own.
+- **An id that is personal data gets a pseudonym.** Items keep their ids, so an email address used as a ticket's id
+  stayed in the redacted copy and the summary, with no warning. In a call that looks for personal data, such an id is
+  now named by a stable pseudonym, as `EMAIL_ADDRESS-3f9a2c1b0d`, in everything System Two reads of the call and in the
+  redacted copy; the results file keeps each id beside its pseudonym, for you. The key stays on your machine
+  (`~/.dsh/system-one/pseudonyms.key`). `pseudonymIds: false` keeps such ids, and the result says so.
+- **One failed request costs only its own items.** A batch threw away every answer when one of its requests failed,
+  while the others kept running, retries and minute-long waits included. Each request now stands on its own: its items
+  carry the error in the results, the summary and the card say how many failed, and System One unavailable stops the
+  requests still waiting. A redacted copy is written whole or not at all.
+- **The results come first.** A palette, 16-bit or interlaced PNG made the annotator fail after every request had
+  run, and nothing was written. The results are written before the copy and the images, and an image the annotator
+  cannot draw on is listed with why, its boxes in the results; `system_one_screen` answers with a note.
+- **Every answer has a column of its own.** CSV headers are escaped as cells are, so a question id with a comma, a
+  quote or a line break keeps its column; a question named `id` or `pseudonym`, or two whose answers would share a
+  column (`team`'s `team_confidence` and a question named `team_confidence`), is refused before anything is asked.
+- **The reflexes never wait behind a batch.** The client waited for one of its 12 slots before a reflex's 8-second
+  limit started, so a running batch could hold the guard, the shield and the triage far longer, and
+  `maxConcurrency: 0` waited forever. A batch now leaves one slot to the reflexes, a reflex's limit counts its wait,
+  and there is always at least one slot.
+
 ## 0.8.1 (2026-11-18)
 
 A security release: update now with `dsh plugin --profile web add @vllm-sr/dsh@0.8.1` (and `--profile headless`

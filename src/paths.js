@@ -1,8 +1,32 @@
 /** The paths a System One tool call names, checked before anything is asked, so System Two can correct one at once. */
 import { readdir, stat } from 'node:fs/promises'
 import { dirname, extname, isAbsolute, relative, resolve } from 'node:path'
+import { landing } from './permissions.js'
 
 const SHOWN = 12
+
+// a path as a file system that ignores letter case and Unicode normalization (Windows, macOS) names it
+const folded = path => path.normalize('NFC').toLowerCase()
+
+/**
+ * Whether writing `target` would write the file at `input`: the same path, a spelling that differs only in letter case
+ * or Unicode normalization (one file on Windows and macOS; refused everywhere, to be safe), a path through a link or a
+ * hard link to it, or a short name (by file identity).
+ */
+export async function sameFile(target, input) {
+  const [a, b] = [resolve(target), resolve(input)]
+  if (folded(a) === folded(b)) return true
+  const [landsA, landsB] = await Promise.all([landing(a), landing(b)])
+  if (landsA && landsB && folded(landsA) === folded(landsB)) return true
+  const [x, y] = await Promise.all([a, b].map(path => stat(path, { bigint: true }).catch(() => undefined)))
+  return Boolean(x && y && x.ino !== 0n && x.dev === y.dev && x.ino === y.ino)
+}
+
+/** The first of `inputs` that writing `target` would write, or undefined. */
+export async function inputAt(target, inputs) {
+  for (const input of inputs) if (input && (await sameFile(target, input))) return input
+  return undefined
+}
 
 /** What is at a path: 'file', 'directory', or undefined when nothing is. */
 export async function kindAt(path) {

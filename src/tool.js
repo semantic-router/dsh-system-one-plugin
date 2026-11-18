@@ -1,12 +1,14 @@
 /** The model-facing `system_one` tool: one rubric, many items, calibrated answers. */
+import { randomBytes } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { REQUEST_TOKENS, compactAnswer, requestSlices, stateCost, unavailable, unavailableText } from './client.js'
 import { formatOf, loadItems } from './items.js'
-import { kindAt, mustBeFile, noFile } from './paths.js'
+import { inputAt, kindAt, mustBeFile, noFile, sameFile } from './paths.js'
 import { deniedText, mayWrite } from './permissions.js'
-import { annotatePng, imageSize } from './png.js'
+import { annotatePng, undrawable } from './png.js'
+import { personalShape, pseudonym } from './pseudonyms.js'
 import { ROUTER_SIGNALS, SENSITIVE_LABELS } from './questions.js'
 import { csvCell, everywhere, joined, redactItem, writeRedacted } from './redact.js'
 import { kindOf, planQuestions, readQuestions, splitArguments, unanswerable } from './rubric.js'
@@ -75,10 +77,18 @@ function defaultOutput(cwd, file, images) {
   return within && !within.startsWith('..') && !isAbsolute(within) ? `${folders[0]}.s1.jsonl` : 'system-one-results.jsonl'
 }
 
-/** Where the annotated copy of one image goes: the file named, into the folder named, or beside the image. */
-function annotatedPath(annotateTo, item) {
-  const out = annotateTo.file ?? (annotateTo.beside ? item.path : join(annotateTo.dir, basename(item.path)))
-  return out === item.path ? `${out.slice(0, -extname(out).length)}.annotated.png` : out
+/**
+ * Where the annotated copy of one image goes: the file named, into the folder named, or beside the image; one that
+ * would land on a file the call reads or writes (`kept`: its image, another image, a source, the results) goes beside
+ * its own image as `<name>.annotated.png`.
+ */
+async function annotatedPath(annotateTo, item, kept) {
+  const named = annotateTo.file ?? (annotateTo.beside ? item.path : join(annotateTo.dir, basename(item.path)))
+  if (!(await inputAt(named, kept))) return named
+  const beside = `${item.path.slice(0, item.path.length - extname(item.path).length)}.annotated.png`
+  const taken = await inputAt(beside, kept)
+  if (taken) throw new Error(`annotate would write the copy of ${item.source} over ${taken === item.path ? 'the image itself' : basename(taken)}: name a folder of its own for the annotated copies`)
+  return beside
 }
 
 /**
@@ -158,8 +168,42 @@ function summarize(questions, rows, asked) {
   return summary
 }
 
+// the columns every row of a CSV and of the first rows has, beside the answers
+const ROW_COLUMNS = ['id', 'pseudonym']
+
+/** The columns one question's answers take in a CSV row and in the first rows. */
+function columnsOf(id, question, kind) {
+  if (kind === 'span') return [id, `${id}_labels`, `${id}_spans`]
+  if (question.type === 'choice' || question.signal) return [id, `${id}_confidence`]
+  if (question.type === 'noul') return [`${id}_yes`]
+  if (question.type === 'score') return [id]
+  return [id, `${id}_confidence`]
+}
+
+/**
+ * Why the questions' answers cannot share a row: a question named as a column every row has (`id`), or two questions
+ * whose answers take one column (`team`'s `team_confidence` and a question named `team_confidence`). Undefined when
+ * every answer has a column of its own.
+ */
+function columnClash(questions, asked) {
+  const owners = new Map(ROW_COLUMNS.map(column => [column, undefined]))
+  for (const [id, question] of Object.entries(questions)) {
+    for (const column of columnsOf(id, question, asked[id].kind)) {
+      if (!owners.has(column)) {
+        owners.set(column, id)
+        continue
+      }
+      const first = owners.get(column)
+      return first === undefined
+        ? `question id "${id}" names the ${column} column, which every result row has for its item: rename the question, as "${id}_answer"`
+        : `questions "${first}" and "${id}" would both write the column ${column} of the results: rename one of them`
+    }
+  }
+  return undefined
+}
+
 function flatRow(row, questions, asked) {
-  const flat = { id: row.id }
+  const flat = { id: row.id, ...(row.pseudonym ? { pseudonym: row.pseudonym } : {}) }
   for (const [id, question] of Object.entries(questions)) {
     const a = row.answers[id]
     if (!a || a.error) {
@@ -189,10 +233,11 @@ async function writeResults(path, rows, questions, asked) {
   if (extname(path).toLowerCase() === '.csv') {
     const flat = rows.map(row => flatRow(row, questions, asked))
     const columns = [...new Set(flat.flatMap(row => Object.keys(row)))]
-    const lines = [columns.join(','), ...flat.map(row => columns.map(column => csvCell(row[column])).join(','))]
+    // a header is a cell like any other: a question id with a comma, a quote or a line break keeps its column
+    const lines = [columns.map(csvCell).join(','), ...flat.map(row => columns.map(column => csvCell(row[column])).join(','))]
     await writeFile(path, lines.join('\n') + '\n')
   } else {
-    await writeFile(path, rows.map(row => JSON.stringify({ id: row.id, text: row.text, answers: row.answers })).join('\n') + '\n')
+    await writeFile(path, rows.map(row => JSON.stringify({ id: row.id, ...(row.pseudonym ? { pseudonym: row.pseudonym } : {}), text: row.text, answers: row.answers })).join('\n') + '\n')
   }
 }
 
@@ -226,7 +271,8 @@ function renderSummary(value) {
   }
   if (value.redacted) lines.push(`Redacted copy: ${value.redacted.output} (${value.redacted.spans} span(s) in ${value.redacted.items} item(s) replaced by their [LABEL])`)
   if (value.annotated) {
-    lines.push(`Annotated copies (boxes in red): ${value.annotated.files.length ? value.annotated.files.join(', ') : 'none: no box was found'}${value.annotated.skipped.length ? `; not drawn (not PNG): ${value.annotated.skipped.join(', ')}` : ''}`)
+    const none = value.annotated.skipped.length ? 'none' : 'none: no box was found'
+    lines.push(`Annotated copies (boxes in red): ${value.annotated.files.length ? value.annotated.files.join(', ') : none}${value.annotated.skipped.length ? `; not drawn on, their boxes are in the results: ${value.annotated.skipped.join(', ')}` : ''}`)
   }
   if (value.preview.length) {
     lines.push('First rows:')
@@ -239,7 +285,7 @@ function renderSummary(value) {
 export function presentation(value, ui) {
   if (ui === 'off') return { systemOne: 1, ui }
   const { model, items, questions, requests, seconds, output, summary } = value
-  const extra = Object.fromEntries(['spanModel', 'examples', 'images', 'redacted', 'annotated', 'sources'].filter(key => value[key] !== undefined).map(key => [key, value[key]]))
+  const extra = Object.fromEntries(['spanModel', 'examples', 'images', 'redacted', 'annotated', 'sources', 'pseudonyms', 'partial'].filter(key => value[key] !== undefined).map(key => [key, value[key]]))
   return { systemOne: 1, ui, model, items, questions, requests, seconds, output, summary, ...extra }
 }
 
@@ -288,6 +334,10 @@ const placeOf = span => (span.line ? `${span.source}:${span.line}` : span.source
 
 const round3 = value => Math.round(value * 1000) / 1000
 
+// the pseudonym key when none is given: one for the process
+let ownKey
+const processKey = async () => (ownKey ??= randomBytes(32))
+
 /**
  * @param {object} deps
  * @param {ReturnType<import('./client.js').createDecisionClient>} deps.client
@@ -297,8 +347,10 @@ const round3 = value => Math.round(value * 1000) / 1000
  *   relative paths resolve against
  * @param {(exec: object) => Promise<object | undefined>} [deps.writePolicyOf] - where the calling session lets tools
  *   write (permissions.js `writePolicy`); undefined writes anywhere
+ * @param {() => Promise<Buffer>} [deps.pseudonymKey] - the key of the pseudonyms of item ids that are personal data
+ *   (pseudonyms.js); by default one that lasts as long as the process
  */
-export function systemOneTool({ client, trace, config, workspaceOf = async () => process.cwd(), writePolicyOf = async () => undefined }) {
+export function systemOneTool({ client, trace, config, workspaceOf = async () => process.cwd(), writePolicyOf = async () => undefined, pseudonymKey = processKey }) {
   return defineTool({
     name: config.toolName,
     description: DESCRIPTION,
@@ -375,19 +427,31 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
         if (missing.length) notes.push(`left out ${missing.length} image(s) that do not exist: ${listed(missing, 6)}`)
         images = found.map(path => resolve(cwd, path))
       }
-      // the results and the redacted copy each take a file of their own, never the input's
+      const sourcePaths = (Array.isArray(args.sources) ? args.sources : typeof args.sources === 'string' ? [args.sources] : []).filter(Boolean)
+      for (const path of sourcePaths) await mustBeFile(cwd, path, 'source')
+      // Every file the call reads, which nothing it writes may land on: the same path, another letter case of it, a
+      // link or a hard link to it.
+      const inputs = [file, ...(images ?? []), ...sourcePaths.map(path => resolve(cwd, path))].filter(Boolean)
+      const inputNamed = input => (input === file ? 'the input file' : images?.includes(input) ? `the image ${pathShown(input)}` : `the source ${pathShown(input)}`)
+      const landsOn = async (target, why) => {
+        const input = await inputAt(target, inputs)
+        if (!input) return
+        const alias = resolve(target) === input ? '' : ` (${pathShown(target)} is that file under another name)`
+        throw new Error(`${why}: give it a path other than ${inputNamed(input)}${alias}`)
+      }
+      // the results and the redacted copy each take a file of their own, never an input's
       let output = resolve(cwd, args.output || defaultOutput(cwd, file, images))
       if ((await kindAt(output)) === 'directory' || /[\\/]$/.test(args.output ?? '')) output = join(output, basename(defaultOutput(cwd, file, images)))
-      if (output === file) throw new Error('output is where the results go: give it a path other than the input file')
+      await landsOn(output, 'output is where the results go')
       let copies = !readOnly && args.redact !== undefined && args.redact !== false && args.redact !== 'false' && args.redact !== null && args.redact !== ''
       const copyTo = !copies ? undefined : typeof args.redact === 'string' && args.redact !== 'true'
         ? resolve(cwd, args.redact)
         : file ? `${file.slice(0, file.length - extname(file).length)}.redacted${extname(file)}` : resolve(cwd, 'system-one-redacted.txt')
-      if (copyTo && copyTo === file) throw new Error('redact writes a copy: give it a path other than the input file')
+      if (copyTo) await landsOn(copyTo, 'redact writes a copy')
       // one path for both: the copy, which was asked for by name, takes it, and the results go where they go by default
-      if (copyTo && copyTo === output) {
+      if (copyTo && (await sameFile(copyTo, output))) {
         const fallback = resolve(cwd, defaultOutput(cwd, file, images))
-        if (fallback === copyTo || fallback === file) throw new Error('redact writes a copy beside the results: give it a path other than output')
+        if ((await sameFile(fallback, copyTo)) || (await inputAt(fallback, inputs))) throw new Error('redact writes a copy beside the results: give it a path other than output')
         output = fallback
         notes.push(`output and redact named one file: the redacted copy is written there, the results to ${relative(cwd, output) || output}`)
       }
@@ -410,8 +474,6 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
         questions = Object.fromEntries(Object.entries(questions).filter(([id]) => !cannot.some(([gone]) => gone === id)))
         for (const [id, why] of cannot) notes.push(`not asked: ${id} (${why})`)
       }
-      const sourcePaths = (Array.isArray(args.sources) ? args.sources : typeof args.sources === 'string' ? [args.sources] : []).filter(Boolean)
-      for (const path of sourcePaths) await mustBeFile(cwd, path, 'source')
       const grounded = sourcePaths.length > 0
       // a signal that judges a reply reads the records' own "user" and "answer" fields when state_fields names none
       const needs = [...new Set(Object.values(questions).flatMap(question => ROUTER_SIGNALS[question.signal]?.parts ?? []))]
@@ -431,8 +493,10 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
           copies = false
           notes.push(`no redacted copy: ${none}`)
         } else if (marking.length === 0) {
+          // an id whose columns no question's answers take
+          const taken = new Set([...ROW_COLUMNS, ...Object.keys(questions).flatMap(name => [name, ...['labels', 'spans', 'confidence', 'yes'].map(suffix => `${name}_${suffix}`)])])
           let id = 'pii'
-          while (Object.hasOwn(questions, id)) id = `${id}_`
+          while ([id, `${id}_labels`, `${id}_spans`].some(column => taken.has(column))) id = `${id}_`
           questions = { ...questions, [id]: { preset: 'pii' } }
           notes.push(`redact: no pii or span question said what to replace, so ${id} ({"preset": "pii"}) marks the personal data it replaces`)
         }
@@ -440,6 +504,9 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
       const model = args.model || config.model
       const spanModel = args.span_model || config.spanModel
       const { groups, asked } = planQuestions(questions, { model, spanModel, parts, images: hasImages })
+      // each answer takes a column of its own in a CSV and in the first rows, beside the item's id
+      const clash = columnClash(questions, asked)
+      if (clash) throw new Error(clash)
       // what gets masked (personal data, else what a redacted copy replaces) keeps the spans that overlap, so that their
       // union is masked: a name marked inside an email address hides the whole address
       const marks = Object.keys(questions).filter(id => asked[id].kind === 'span' && questions[id].preset !== 'halu' && questions[id].preset !== 'evidence')
@@ -463,7 +530,17 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
       }
       if (output) await allowed(output, 'output')
       if (copies) await allowed(copyTo, 'redact')
-      if (annotateTo) for (const item of items) if (item.path) await allowed(annotatedPath(annotateTo, item), 'annotate')
+      // each image's annotated copy, decided before anything is asked
+      const drawTo = new Map()
+      if (annotateTo) {
+        const kept = [...inputs, ...(output ? [output] : []), ...(copies ? [copyTo] : [])]
+        for (const item of items) {
+          if (!item.path) continue
+          const target = await annotatedPath(annotateTo, item, kept)
+          await allowed(target, 'annotate')
+          drawTo.set(item, target)
+        }
+      }
       const context = args.context?.trim()
       const sources = grounded ? await readSources(sourcePaths, cwd, context) : undefined
 
@@ -503,21 +580,54 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
         for (const { start, count } of slices) jobs.push({ group, start, count, texts })
       }
       const started = performance.now()
-      let answered
-      try {
-        answered = await Promise.all(jobs.map(async ({ group, start, count, texts }) => {
-          const slice = texts.slice(start, start + count).map(({ state, images: attached }) => ({ state, images: attached }))
-          const response = await client.ask({ model: group.model, questions: group.questions, inputs: slice, signal: exec.signal, ...BATCH_LIMITS })
-          return { group, start, response }
-        }))
-      } catch (error) {
+      // Each request is settled on its own: the items of one that failed carry its error in place of their answers, and
+      // the others keep theirs. System One unavailable after a request's retries stops the requests still waiting or
+      // running, which would only wait out the same retries on the same client.
+      const stop = new AbortController()
+      const signal = exec.signal ? AbortSignal.any([exec.signal, stop.signal]) : stop.signal
+      let stopped
+      const settled = await Promise.all(jobs.map(async job => {
+        const slice = job.texts.slice(job.start, job.start + job.count).map(({ state, images: attached }) => ({ state, images: attached }))
+        try {
+          return { ...job, response: await client.ask({ model: job.group.model, questions: job.group.questions, inputs: slice, signal, batch: true, ...BATCH_LIMITS }) }
+        } catch (error) {
+          if (stopped && stop.signal.aborted && !exec.signal?.aborted) return { ...job, error: stopped, skipped: true }
+          if (!stopped && unavailable(error)) {
+            stopped = error
+            stop.abort(error)
+          }
+          return { ...job, error }
+        }
+      }))
+      if (exec.signal?.aborted) throw settled.find(job => job.error)?.error ?? exec.signal.reason
+      const answered = settled.filter(job => job.response)
+      const failed = settled.filter(job => job.error)
+      if (answered.length === 0) {
+        const error = (failed.find(job => !job.skipped) ?? failed[0]).error
         throw unavailable(error) ? new Error(unavailableText(error)) : error
       }
       const seconds = Math.round((performance.now() - started) / 10) / 100
 
       const rows = items.map(item => ({ id: item.id, text: item.source ?? clip(item.text, 200), answers: {} }))
+      // the items of a request that failed: each of its questions answered by the error
+      for (const job of failed) {
+        const said = clip(String(job.error?.message ?? job.error), 200)
+        const answer = job.skipped ? { error: 'not_asked', reason: `another request of this call failed first: ${said}` } : { error: unavailable(job.error) ? 'unavailable' : 'request_failed', reason: said }
+        for (let index = job.start; index < job.start + job.count; index++) {
+          for (const id of Object.values(job.group.ids)) rows[index].answers[id] = { ...answer }
+        }
+      }
+      let partial
+      if (failed.length) {
+        const first = failed.find(job => !job.skipped) ?? failed[0]
+        const hit = new Set(failed.flatMap(job => Array.from({ length: job.count }, (_, offset) => job.start + offset)))
+        partial = { failed: failed.length, requests: jobs.length, items: hit.size }
+        notes.push(`${failed.length} of ${jobs.length} requests failed (${clip(String(first.error?.message ?? first.error), 160)}): ${hit.size} item(s) have an error in place of their answers; call again for them`)
+      }
       // the spans of each item, whole, for redaction and Chat: rows keep no personal data's text
       const found = items.map(() => ({}))
+      // the items whose own id is personal data, by the label it carries
+      const idLabels = new Map()
       let inputTokens = 0
       for (const { group, start, response } of answered) {
         inputTokens += response.inputTokens
@@ -545,9 +655,14 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
             const kept = question.preset !== 'pii' || question.labels === 'all' ? undefined : question.labels ?? config.privacyLabels ?? SENSITIVE_LABELS
             if (kept) spans = spans.filter(span => kept.includes(span.label))
             if (question.preset === 'pii') spans = spans.map(span => trimSpan(span, items[index].text)).filter(Boolean)
-            // an item's id names it, whatever it looks like
+            // an item's id names it, whatever it looks like; personal data marked in it is said, and named by a pseudonym
             const named = typeof state === 'string' ? items[index].segments?.find(segment => segment.field !== undefined && segment.field === items[index].idField) : undefined
-            spans = spans.filter(span => !(named && span.start < named.end && span.end > named.start) && !(question.preset === 'pii' && notPersonal(span, items[index].text)))
+            const inId = span => named && span.start < named.end && span.end > named.start
+            if (question.preset === 'pii' && !idLabels.has(index)) {
+              const own = spans.find(span => inId(span) && !notPersonal(span, items[index].text))
+              if (own) idLabels.set(index, own.label)
+            }
+            spans = spans.filter(span => !inId(span) && !(question.preset === 'pii' && notPersonal(span, items[index].text)))
             const at = states[index].sourcesAt
             if (question.preset === 'evidence' && at !== undefined && entry.over === 'context') {
               spans = spans.map(span => ({ ...span, ...(span.start >= at ? sourceAt(sources.blocks, span.start - at) : { source: fields.context }) }))
@@ -569,37 +684,91 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
           }
         })
       }
-      // a call that looks for personal data keeps it out of the results' text as well
+      // a call that looks for personal data keeps it out of the results' text as well, and an item it could not look at
+      // keeps no text there
       const personalIds = Object.keys(questions).filter(id => questions[id].preset === 'pii')
       const personalOf = index => personalIds.flatMap(id => found[index][id] ?? [])
+      const unlooked = index => personalIds.some(id => rows[index].answers[id]?.error !== undefined)
       for (const [index, item] of items.entries()) {
         const spans = personalOf(index)
-        if (spans.length && item.source === undefined) rows[index].text = clip(redactItem(item, spans).text, 200)
+        if (unlooked(index)) delete rows[index].text
+        else if (spans.length && item.source === undefined) rows[index].text = clip(redactItem(item, spans).text, 200)
       }
       // and one that looks for jailbreaks or harm keeps their words out: System Two reading the results reads no attack
       if (Object.values(questions).some(question => SAFETY_SIGNALS.has(question.signal))) for (const row of rows) delete row.text
 
+      // Item ids that are personal data, in a call that looks for personal data: what pii marked in an id's own field,
+      // or an id shaped as an email address, an IP address or a phone number. This result and the redacted copy name
+      // them by stable pseudonyms; the results file keeps each id beside its pseudonym, for you to act on.
+      let pseudonyms
+      // a JSON object's keys that are personal data, named the same way in its redacted copy
+      const keyAliases = []
+      if (personalIds.length) {
+        for (const [index, item] of items.entries()) {
+          if (!idLabels.has(index) && item.idField !== undefined && personalShape(item.id)) idLabels.set(index, personalShape(item.id))
+        }
+        const keyLabels = items.map(item => (item.key !== undefined ? personalShape(item.key) : undefined))
+        const on = config.pseudonymIds !== false
+        if (on && (idLabels.size || keyLabels.some(Boolean))) {
+          const key = await pseudonymKey()
+          for (const [index, label] of idLabels) rows[index].pseudonym = pseudonym(key, label, items[index].id)
+          keyLabels.forEach((label, index) => {
+            if (label) keyAliases[index] = pseudonym(key, label, items[index].key)
+          })
+        }
+        if (idLabels.size) {
+          const labels = labelCounts([...idLabels.values()].map(label => ({ label })))
+          const said = Object.entries(labels).map(([label, n]) => `${label} ${n}`).join(', ')
+          pseudonyms = { items: idLabels.size, labels, named: on ? 'pseudonyms' : 'kept' }
+          notes.push(on
+            ? `${idLabels.size} item id(s) are personal data (${said}): this result and the redacted copy name them by pseudonyms, as ${rows.find(row => row.pseudonym).pseudonym}, the same for the same id in every call; the results file keeps each id beside its pseudonym`
+            : `${idLabels.size} item id(s) are personal data (${said}), and they are kept as they are in this result, the results file and the redacted copy (pseudonymIds is off)`)
+        }
+      }
+      // what this result shows of each item: its pseudonym where it has one
+      const shownRows = rows.map(({ pseudonym: alias, ...row }) => (alias ? { ...row, id: alias } : row))
+
+      // The results first: a copy or an image that fails later leaves them written.
+      if (output) {
+        await allowed(output, 'output')
+        await mkdir(dirname(output), { recursive: true })
+        await writeResults(output, rows, questions, asked)
+      }
+
       let redacted
       if (copies) {
-        // personal data when the call looks for it, else what its own labels mark
+        // personal data when the call looks for it, else what its own labels mark; a copy of items some of which were
+        // not looked at would pass on what they hold, so none is written
+        const marking = [...masked]
+        const unmarked = items.map((_, index) => index).filter(index => marking.some(id => rows[index].answers[id]?.error !== undefined))
+        if (unmarked.length) {
+          const why = rows[unmarked[0]].answers[marking.find(id => rows[unmarked[0]].answers[id]?.error !== undefined)]
+          notes.push(`no redacted copy: ${unmarked.length} item(s) were not marked (${clip([why.error, why.reason].filter(Boolean).join(': '), 160)}), and a copy would keep what they hold; call again`)
+          copies = false
+        }
+      }
+      if (copies) {
         const marking = [...masked]
         const out = copyTo
         let spanCount = 0
         let changed = 0
         const records = items.map((item, index) => {
           const spans = marking.flatMap(id => found[index][id] ?? [])
-          if (spans.length === 0) return item.record
-          const copy = redactItem(item, spans)
+          const copy = spans.length ? redactItem(item, spans) : { record: item.record, replaced: 0 }
           spanCount += copy.replaced
           if (copy.replaced) changed++
-          return copy.record
+          const alias = rows[index].pseudonym
+          const record = copy.record
+          return alias && typeof record === 'object' && record !== null && item.idField !== undefined ? { ...record, [item.idField]: alias } : record
         })
         await allowed(out, 'redact')
         await mkdir(dirname(out), { recursive: true })
-        await writeRedacted({ file, format: file ? formatOf(file) : 'lines', output: out, items, records })
+        await writeRedacted({ file, format: file ? formatOf(file) : 'lines', output: out, items, records, keys: keyAliases.length ? items.map((item, index) => keyAliases[index] ?? item.key) : undefined })
         redacted = { output: out, items: changed, spans: spanCount }
       }
 
+      // An image the annotator cannot draw on (not a PNG, a 16-bit or an interlaced one) is left out, and said; its
+      // boxes are in the results.
       let annotated
       if (annotateTo) {
         const dir = annotateTo.dir ?? dirname(annotateTo.file ?? items[0].path)
@@ -610,23 +779,28 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
           const boxes = boxIds.map(id => rows[index].answers[id]).filter(a => a?.box && a.confidence >= FOUND_AT)
           if (!item.path || boxes.length === 0) continue
           const bytes = await readFile(item.path)
-          if (imageSize(bytes)?.type !== 'png') {
-            annotated.skipped.push(item.source)
+          let drawn
+          const why = undrawable(bytes)
+          if (!why) {
+            try {
+              drawn = annotatePng(bytes, boxes.map(a => ({ box: a.box })))
+            } catch (error) {
+              annotated.skipped.push(`${item.source} (${clip(String(error?.message ?? error), 100)})`)
+              continue
+            }
+          }
+          if (!drawn) {
+            annotated.skipped.push(`${item.source} (${why})`)
             continue
           }
-          const out = annotatedPath(annotateTo, item)
+          const out = drawTo.get(item)
           await allowed(out, 'annotate')
-          await writeFile(out, annotatePng(bytes, boxes.map(a => ({ box: a.box }))))
+          await mkdir(dirname(out), { recursive: true })
+          await writeFile(out, drawn)
           annotated.files.push(relative(cwd, out) || out)
         }
       }
-
-      if (output) {
-        await allowed(output, 'output')
-        await mkdir(dirname(output), { recursive: true })
-        await writeResults(output, rows, questions, asked)
-      }
-      const summary = summarize(questions, rows, asked)
+      const summary = summarize(questions, shownRows, asked)
 
       // for Chat: a few marked items per span question, and the images with their boxes
       const examples = {}
@@ -655,7 +829,7 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
             shown = spans.filter(span => span.line === undefined && span.source === spans[0].source)
           }
           return {
-            id: item.id,
+            id: rows[index].pseudonym ?? item.id,
             kind,
             parts: excerpts(read, shown, { hide: kind === 'masked', around: kind === 'evidence' ? 28 : 40, max: 1, clip: 120, rank: true })[0],
             ...(spans[0].source ? { source: placeOf(spans[0]) } : {}),
@@ -681,12 +855,14 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
         inputTokens,
         output,
         summary,
-        preview: rows.slice(0, 3).map(row => flatRow(row, questions, asked)),
+        preview: shownRows.slice(0, 3).map(row => flatRow(row, questions, asked)),
         ...(Object.keys(examples).length ? { examples } : {}),
         ...(shownImages ? { images: shownImages } : {}),
         ...(redacted ? { redacted } : {}),
         ...(annotated ? { annotated } : {}),
         ...(sources ? { sources: sources.blocks.map(block => block.source) } : {}),
+        ...(pseudonyms ? { pseudonyms } : {}),
+        ...(partial ? { partial } : {}),
         ...(notes.length ? { notes } : {}),
       }
       trace({

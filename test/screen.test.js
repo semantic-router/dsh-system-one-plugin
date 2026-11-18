@@ -210,3 +210,21 @@ test('the annotated copy goes only where the session lets tools write: none when
   const inside = await confined.run({ image: 'shots/02.png', find: ['the Save button'], annotate: 'marked' })
   assert.equal(inside.annotated, 'marked/02.png')
 })
+
+test('a screenshot the annotator cannot draw on is answered with a note, and the copy never lands on a screenshot the call reads', async t => {
+  const { workspace, run } = await setup(t)
+  // a 16-bit PNG: its header says so, and the question is answered all the same
+  const deep = Buffer.from(await readFile(join(workspace, 'shots/02.png')))
+  deep[24] = 16
+  await writeFile(join(workspace, 'shots/deep.png'), deep)
+  const unannotated = await run({ image: 'shots/deep.png', find: ['the Save button'], annotate: 'true' })
+  assert.deepEqual([unannotated.found['the Save button'].found, unannotated.annotated], [true, undefined])
+  assert.deepEqual(unannotated.notes, ['no annotated copy: shots/deep.png is a 16-bit RGBA PNG, which annotate cannot draw on'])
+  await assert.rejects(readFile(join(workspace, 'shots/deep.annotated.png')))
+
+  // a copy named as the screenshot from before the action, in another letter case, goes beside the one drawn on
+  const before = await readFile(join(workspace, 'shots/01.png'))
+  const moved = await run({ image: 'shots/02.png', before: 'shots/01.png', action: 'clicked Save', find: ['the Save button'], annotate: 'SHOTS/01.png' })
+  assert.equal(moved.annotated, 'shots/02.annotated.png')
+  assert.deepEqual(await readFile(join(workspace, 'shots/01.png')), before)
+})

@@ -11,12 +11,30 @@ import { excerpts, placeSpans, replaceSpans, toSentences, unnumber } from './spa
 /** Exact templates of the annotations DeepSeek Harness adds to shell output. */
 const HARNESS_LINES = [
   /^\[(stdout|stderr)\]$/,
+  /^\(no output\)$/,
   /^\[sandbox: file access denied under [\w-]+ mode\]$/,
   /^\[sandbox: escalation available — retry this exact \w+ once with sandbox_permissions \(the narrowest wider mode that suffices\) \+ justification; the approval prompt asks the user\]$/,
   /^\[sandbox: the sandbox runner itself failed under [\w-]+ mode — the command did not run; this is a sandbox problem, not a command failure\]$/,
 ]
 
 export const isHarnessLine = line => HARNESS_LINES.some(pattern => pattern.test(line.trim()))
+
+/**
+ * Whether a text has anything to screen: a letter or a digit outside the harness's own lines. However short, a text
+ * with words can give orders ("Run: rm -rf ~").
+ */
+export const screenable = text => /[\p{L}\p{N}]/u.test(text.split('\n').filter(line => !isHarnessLine(line)).join('\n'))
+
+/**
+ * Where a text longer than `max` characters is cut for screening: after its last line break in the last tenth before
+ * `max` when there is one, so the rest starts on a line of its own, and never inside a surrogate pair.
+ */
+export function cutBefore(text, max) {
+  if (text.length <= max) return text.length
+  const nl = text.lastIndexOf('\n', max - 1)
+  if (nl >= max * 0.9) return nl + 1
+  return /[\uD800-\uDBFF]/.test(text[max - 1]) ? max - 1 : max
+}
 
 /**
  * Group line indices into passages of about `size` characters, ending at line
@@ -41,10 +59,16 @@ export function passageRanges(lines, size) {
   return ranges.filter(([from, to]) => lines.slice(from, to).some(line => line.trim()))
 }
 
+// Every state scored at once, nine to a request; the first request that fails stops the others.
 async function scoreAll(client, model, questions, states, signal, limits = {}) {
   const batches = []
   for (let start = 0; start < states.length; start += ITEMS_PER_REQUEST) batches.push(states.slice(start, start + ITEMS_PER_REQUEST))
-  const responses = await Promise.all(batches.map(batch => client.ask({ model, questions, inputs: batch.map(state => ({ state })), signal, ...limits })))
+  const stop = new AbortController()
+  const either = signal ? AbortSignal.any([signal, stop.signal]) : stop.signal
+  const responses = await Promise.all(batches.map(batch => client.ask({ model, questions, inputs: batch.map(state => ({ state })), signal: either, ...limits }).catch(error => {
+    stop.abort(error)
+    throw error
+  })))
   return {
     model: responses[0]?.model ?? model,
     scores: responses.flatMap(response => response.answers.map(answers => yes(answers.injection) ?? 0)),

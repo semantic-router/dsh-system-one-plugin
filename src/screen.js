@@ -3,9 +3,9 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { compactAnswer, unavailable, unavailableText } from './client.js'
-import { kindAt, noFile } from './paths.js'
+import { inputAt, kindAt, noFile } from './paths.js'
 import { deniedText, mayWrite } from './permissions.js'
-import { annotatePng, imageSize } from './png.js'
+import { annotatePng, imageSize, undrawable } from './png.js'
 import { kindOf, readQuestions } from './rubric.js'
 import { FOUND_AT } from './tool.js'
 import { clip } from './trace.js'
@@ -217,15 +217,22 @@ export function screenTool({ client, trace, config, workspaceOf = async () => pr
       let annotateTo
       if (given(args.annotate) && args.annotate !== false && args.annotate !== 'false') {
         const beside = `${shot.path.slice(0, shot.path.length - extname(shot.path).length)}.annotated.png`
+        // a screenshot the annotator cannot draw on is answered all the same, with a note
+        const why = undrawable(shot.bytes)
         if (shot.size.type !== 'png') notes.push('no annotated copy: annotate draws on PNG screenshots')
+        else if (why) notes.push(`no annotated copy: ${shot.shown} is ${why}, which annotate cannot draw on`)
         else if (args.annotate === true || args.annotate === 'true') annotateTo = beside
         else {
           const named = resolve(cwd, String(args.annotate))
           const at = await kindAt(named)
           const into = at === 'directory' || (at === undefined && !/\.(png|jpe?g|webp)$/i.test(named))
           annotateTo = into ? join(named, basename(shot.path)) : named
-          if (annotateTo === shot.path) annotateTo = beside
         }
+        // never onto a screenshot the call reads, under any name it has
+        const reads = [shot.path, ...(before ? [before.path] : [])]
+        if (annotateTo && (await inputAt(annotateTo, reads))) annotateTo = beside
+        const over = annotateTo && (await inputAt(annotateTo, reads))
+        if (over) throw new Error(`annotate would write over the screenshot ${relative(cwd, over) || over}: name a file or a folder of its own for the annotated copy`)
       }
       // the copy goes only where DeepSeek Harness lets its own write tool write in this session
       const policy = annotateTo ? await writePolicyOf(exec) : undefined
@@ -287,10 +294,18 @@ export function screenTool({ client, trace, config, workspaceOf = async () => pr
       let annotated
       if (annotateTo) {
         const marks = Object.values(found).filter(target => target.found).flatMap(target => [{ box: target.box }, { point: target.click }])
-        await allowed(annotateTo)
-        await mkdir(dirname(annotateTo), { recursive: true })
-        await writeFile(annotateTo, annotatePng(shot.bytes, marks))
-        annotated = relative(cwd, annotateTo) || annotateTo
+        let drawn
+        try {
+          drawn = annotatePng(shot.bytes, marks)
+        } catch (error) {
+          notes.push(`no annotated copy: ${shot.shown} could not be drawn on (${clip(String(error?.message ?? error), 100)})`)
+        }
+        if (drawn) {
+          await allowed(annotateTo)
+          await mkdir(dirname(annotateTo), { recursive: true })
+          await writeFile(annotateTo, drawn)
+          annotated = relative(cwd, annotateTo) || annotateTo
+        }
       }
 
       const value = {

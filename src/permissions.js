@@ -35,7 +35,7 @@ const MISSING = new Set(['ENOENT', 'ENOTDIR'])
  * Where a write to `path` lands: its deepest existing ancestor with every link resolved, and the rest of the path. A
  * link whose target does not exist, which a write would follow, lands nowhere it can say.
  */
-async function landing(path) {
+export async function landing(path) {
   const rest = []
   for (let at = resolve(path); ; ) {
     try {

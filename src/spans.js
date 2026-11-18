@@ -227,13 +227,14 @@ function merged(spans, text) {
 
 /**
  * Each span grown to the whole sentence it sits in: an injection is a sentence of orders, and a span model may mark
- * only its loudest words. A sentence ends after `.`, `!` or `?`, at a blank line, and at a line that holds only a
- * delimiter (`<!--`, `-->`, a code fence).
+ * only its loudest words. A sentence ends after `.`, `!` or `?` before a space, after the Chinese and Japanese marks
+ * `。`, `！` and `？` (no space follows them), at every line break, so a line without final punctuation (a command, a
+ * list item) is a sentence of its own, and at a line that holds only a delimiter (`<!--`, `-->`, a code fence).
  */
 export function toSentences(text, spans) {
   const stops = [0, text.length]
-  for (const match of text.matchAll(/[.!?](?=\s)/g)) stops.push(match.index + 1)
-  for (const pattern of [/\n[ \t]*\n/g, /^[ \t]*(?:<!--|-->|```|~~~)[^\n]*$/gm]) {
+  for (const match of text.matchAll(/[.!?](?=\s)|[。．｡！？]/g)) stops.push(match.index + 1)
+  for (const pattern of [/\n/g, /^[ \t]*(?:<!--|-->|```|~~~)[^\n]*$/gm]) {
     for (const match of text.matchAll(pattern)) stops.push(match.index, match.index + match[0].length)
   }
   stops.sort((a, b) => a - b)
