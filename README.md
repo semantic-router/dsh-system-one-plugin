@@ -159,7 +159,8 @@ passages of tool results it screens, the end of each turn, and what System Two h
 results it masks to System One whole, and System Two gets the conversation, as any LLM provider does, with the agent
 session's random id so that the router keeps a session on one model. System Duo logs
 requests to improve its services and train models, so read its [privacy page](https://app.vllm-sr.ai/privacy) before
-you use it with private code or data. Every reflex can be turned off, and the local trace never records keys.
+you use it with private code or data. Every reflex can be turned off, and the local trace redacts keys, tokens,
+passwords and cookies before it writes anything.
 
 **Does it run headless or in CI?** Yes: `dsh plugin --profile headless add @vllm-sr/dsh`, then
 `dsh headless "…"`. A headless run reads its key when it starts, so its first run fetches the key and the LLM answers

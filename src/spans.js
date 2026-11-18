@@ -22,9 +22,11 @@ function boundaries(text) {
  * @param {string} text - what the question read
  * @param {object} [options]
  * @param {number} [options.min] - the lowest probability kept
+ * @param {boolean} [options.overlaps] - keep overlapping spans too, for a caller that masks their union (redact.js
+ *   `joined`): a name marked inside an email address hides the whole address
  * @returns {Array<{label: string, start: number, end: number, text: string, probability: number}>}
  */
-export function placeSpans(spans, text, { min = 0 } = {}) {
+export function placeSpans(spans, text, { min = 0, overlaps = false } = {}) {
   if (!Array.isArray(spans) || typeof text !== 'string' || text.length === 0) return []
   const at = boundaries(text)
   const placed = []
@@ -46,8 +48,13 @@ export function placeSpans(spans, text, { min = 0 } = {}) {
     placed.push({ label: String(span.label ?? ''), start, end, text: span.text, probability })
   }
   placed.sort((a, b) => a.start - b.start || b.probability - a.probability)
+  return overlaps ? placed : apart(placed)
+}
+
+/** Sorted spans without overlaps: of two that overlap, the more probable stays. */
+export function apart(spans) {
   const kept = []
-  for (const span of placed) {
+  for (const span of spans) {
     const last = kept.at(-1)
     if (last && span.start < last.end) {
       if (span.probability > last.probability) kept[kept.length - 1] = span
@@ -292,17 +299,22 @@ export function labelCounts(spans) {
 }
 
 /**
- * Cut `text` into windows of at most `size` UTF-16 units that end at line breaks where they can, for questions whose
- * target is limited. @returns {Array<{start: number, text: string}>}
+ * Cut `text` into windows of at most `size` UTF-16 units that end at line breaks where they can, else after a space, so
+ * that a word, an email address or a number stays in one window, and never inside a surrogate pair, for questions
+ * whose target is limited. @returns {Array<{start: number, text: string}>}
  */
 export function windows(text, size) {
   const out = []
+  const half = Math.floor(size / 2)
   let start = 0
   while (start < text.length) {
     let end = Math.min(text.length, start + size)
     if (end < text.length) {
-      const nl = text.lastIndexOf('\n', end)
-      if (nl > start + size / 2) end = nl + 1
+      const nl = text.lastIndexOf('\n', end - 1)
+      const space = text.slice(start + half, end).search(/\s\S*$/)
+      if (nl > start + half) end = nl + 1
+      else if (space >= 0) end = start + half + space + 1
+      else if (/[\uD800-\uDBFF]/.test(text[end - 1])) end--
     }
     out.push({ start, text: text.slice(start, end) })
     start = end
