@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import http from 'node:http'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { registerHooks } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -41,7 +41,7 @@ function fakeVision() {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve({ server, url: `http://127.0.0.1:${server.address().port}`, asked })))
 }
 
-async function setup(t) {
+async function setup(t, { writePolicyOf } = {}) {
   process.env.S1_SCREEN_KEY = 'sk-vsr-test'
   const workspace = await mkdtemp(join(tmpdir(), 's1-screen-'))
   await mkdir(join(workspace, 'shots'))
@@ -53,7 +53,7 @@ async function setup(t) {
   const { server, url, asked } = await fakeVision()
   const client = createDecisionClient({ baseURL: url, apiKeyEnv: 'S1_SCREEN_KEY' })
   const traced = []
-  const tool = screenTool({ client, trace: entry => traced.push(entry), config: { screenModel: 'vllm-sr/vela3-turbo', systemOneUi: 'card' }, workspaceOf: async () => workspace })
+  const tool = screenTool({ client, trace: entry => traced.push(entry), config: { screenModel: 'vllm-sr/vela3-turbo', systemOneUi: 'card' }, workspaceOf: async () => workspace, writePolicyOf })
   t.after(async () => {
     client.close()
     server.close()
@@ -190,4 +190,23 @@ test('a screen step asks only what it is given, takes find as a list, and refuse
   const unnamed = await run({ image: 'shots/02.png', before: 'shots/01.png' })
   assert.match(asked[0].questions.succeeded.instructions, /The action was: the last step of the task\. Did the action succeed\?/)
   assert.equal(unnamed.action.text, 'the last step')
+})
+
+test('the annotated copy goes only where the session lets tools write: none when read-only, and none outside the workspace', async t => {
+  const readOnly = await setup(t, { writePolicyOf: async () => ({ mode: 'read-only', roots: [] }) })
+  const kept = await readOnly.run({ image: 'shots/02.png', find: ['the Save button'], annotate: 'true' })
+  assert.deepEqual([kept.annotated, kept.notes, kept.found['the Save button'].found], [undefined, ['no annotated copy: this session is read-only'], true])
+  assert.deepEqual((await readdir(join(readOnly.workspace, 'shots'))).sort(), ['01.png', '02.png', '03.jpg'])
+
+  let policy
+  const confined = await setup(t, { writePolicyOf: async () => policy })
+  policy = { mode: 'workspace-write', workspace: confined.workspace, roots: [confined.workspace] }
+  const outside = await mkdtemp(join(tmpdir(), 's1-outside-'))
+  t.after(() => rm(outside, { recursive: true, force: true }))
+  await assert.rejects(confined.run({ image: 'shots/02.png', find: ['the Save button'], annotate: join(outside, 'marked.png') }),
+    error => error.message.startsWith(`annotate ${join(outside, 'marked.png')} is outside this session's workspace (${confined.workspace})`))
+  assert.equal(confined.asked.length, 0, 'refused before anything was asked')
+  assert.deepEqual(await readdir(outside), [])
+  const inside = await confined.run({ image: 'shots/02.png', find: ['the Save button'], annotate: 'marked' })
+  assert.equal(inside.annotated, 'marked/02.png')
 })

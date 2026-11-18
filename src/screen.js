@@ -1,9 +1,10 @@
 /** The model-facing `system_one_screen` tool: System One as the eyes of a computer-use step. */
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { basename, dirname, extname, join, relative, resolve } from 'node:path'
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { compactAnswer, unavailable, unavailableText } from './client.js'
 import { kindAt, noFile } from './paths.js'
+import { deniedText, mayWrite } from './permissions.js'
 import { annotatePng, imageSize } from './png.js'
 import { kindOf, readQuestions } from './rubric.js'
 import { FOUND_AT } from './tool.js'
@@ -122,8 +123,10 @@ export function screenPresentation(value, ui) {
  * @param {(entry: object) => void} deps.trace
  * @param {object} deps.config
  * @param {(exec: object) => Promise<string>} [deps.workspaceOf]
+ * @param {(exec: object) => Promise<object | undefined>} [deps.writePolicyOf] - where the calling session lets tools
+ *   write (permissions.js `writePolicy`); undefined writes anywhere
  */
-export function screenTool({ client, trace, config, workspaceOf = async () => process.cwd() }) {
+export function screenTool({ client, trace, config, workspaceOf = async () => process.cwd(), writePolicyOf = async () => undefined }) {
   return defineTool({
     name: SCREEN_TOOL,
     description: DESCRIPTION,
@@ -224,6 +227,17 @@ export function screenTool({ client, trace, config, workspaceOf = async () => pr
           if (annotateTo === shot.path) annotateTo = beside
         }
       }
+      // the copy goes only where DeepSeek Harness lets its own write tool write in this session
+      const policy = annotateTo ? await writePolicyOf(exec) : undefined
+      const allowed = async path => {
+        if (await mayWrite(policy, path)) return
+        const inside = relative(cwd, path)
+        throw new Error(deniedText(policy, 'annotate', inside && !inside.startsWith('..') && !isAbsolute(inside) ? inside : path))
+      }
+      if (policy?.roots.length === 0) {
+        notes.push(`no annotated copy: ${policy.unknown ? 'this session\'s file policy could not be read' : 'this session is read-only'}`)
+        annotateTo = undefined
+      } else if (annotateTo) await allowed(annotateTo)
 
       const started = performance.now()
       let seen
@@ -273,6 +287,7 @@ export function screenTool({ client, trace, config, workspaceOf = async () => pr
       let annotated
       if (annotateTo) {
         const marks = Object.values(found).filter(target => target.found).flatMap(target => [{ box: target.box }, { point: target.click }])
+        await allowed(annotateTo)
         await mkdir(dirname(annotateTo), { recursive: true })
         await writeFile(annotateTo, annotatePng(shot.bytes, marks))
         annotated = relative(cwd, annotateTo) || annotateTo

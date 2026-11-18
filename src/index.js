@@ -26,6 +26,7 @@ import { SERVICES, appendDotenv, describeKeys, ensureKeys, readDotenv } from './
 import {
   DANGER_SPANS, DONE, EFFORT_LEVELS, EVIDENCE_SPANS, GUARD, HALU_SPANS, HARM_SIGNAL, PII_SPANS, REFUSAL_SIGNAL, REPLY_HARM_SIGNAL, RISK_LEVELS, SENSITIVE_LABELS, TRIAGE,
 } from './questions.js'
+import { writePolicy } from './permissions.js'
 import { UI_MODES, approvalOutcome, createRecorder, failureOf, relativeTo, subject } from './records.js'
 import { holdFetch, inCall, routerHeaders, withinCall } from './router.js'
 import { SCREEN_TOOL, screenTool } from './screen.js'
@@ -70,7 +71,9 @@ export const Config = z.object({
   privacyAt: z.number().default(0.5),
   // the pii preset's sensitive labels, for the privacy reflex and the system_one tool's pii questions
   privacyLabels: z.array(z.string()).default(SENSITIVE_LABELS),
-  privacyTools: z.array(z.string()).default(['web_fetch', 'bash', 'read']),
+  // the tools whose results bring in text from files, shells and the web: read and grep, bash, pwsh and a background
+  // job's output, web_fetch and web_search
+  privacyTools: z.array(z.string()).default(['web_fetch', 'bash', 'read', 'pwsh', 'job_output', 'grep', 'web_search']),
 
   guard: z.boolean().default(true),
   // a span model answers the guard's questions, its signals and the dangerous part in one request
@@ -126,6 +129,10 @@ export const Config = z.object({
 const SOURCE = { kind: 'system-one' }
 // how long a step waits for the free keys of the first run before it goes on without them
 const KEYS_WAIT_MS = 20000
+// how long the published models list holds, and how soon a list that could not be read is asked again: privacy needs
+// it, so one failed request must not turn privacy off for long
+const MODELS_FOR_MS = 600000
+const MODELS_RETRY_MS = 15000
 // a decision that takes longer than this shows in Chat as deciding until its answer takes its place
 export const DECIDING_MS = 700
 
@@ -267,16 +274,24 @@ export function apply(ctx, config) {
   }
 
   // Which models answer span questions, and with them the router's signals (the Vela 3.0 models): the published models
-  // list, asked again every ten minutes. `spans: on` vouches for spanModel without asking.
+  // list, asked again every ten minutes, and 15 seconds after it could not be read. `spans: on` vouches for spanModel
+  // without asking.
   let cardCheck
   function spanAnswers(model) {
     if (config.spans === 'on' && model === config.spanModel) return Promise.resolve(true)
     if (!cardCheck || cardCheck.until < Date.now()) {
-      const ready = client.models()
+      const check = { until: Date.now() + MODELS_FOR_MS }
+      check.ready = client.models()
         .then(cards => new Set(cards.filter(card => Array.isArray(card?.question_types) && card.question_types.includes('span')).map(card => card.id)))
-        .catch(() => new Set())
-      cardCheck = { until: Date.now() + 600000, ready }
-      ready.then(spanModels => trace({ ev: 'spans', models: [...spanModels] }))
+        .catch(error => {
+          check.until = Date.now() + MODELS_RETRY_MS
+          // the status alone: a network error's message can name an address
+          check.failed = error?.status ? `Decision API ${error.status}` : 'the Decision API did not answer'
+          trace({ ev: 'spans', error: String(error?.message ?? error) })
+          return new Set()
+        })
+      cardCheck = check
+      check.ready.then(spanModels => check.failed || trace({ ev: 'spans', models: [...spanModels] }))
     }
     return cardCheck.ready.then(spanModels => spanModels.has(model))
   }
@@ -369,9 +384,12 @@ export function apply(ctx, config) {
     }
   }
 
+  // where the calling session lets tools write, as DeepSeek Harness's sandbox decides it for its own write tool
+  const writePolicyOf = async exec => writePolicy({ sandboxPolicy: ctx.get('sandboxPolicy'), fs: ctx.get('fs') }, exec?.agent?.session)
+
   const OWN_TOOLS = new Set([config.toolName, SCREEN_TOOL])
-  if (config.tool) ctx.tools.register(systemOneTool({ client, trace, config, workspaceOf }))
-  if (config.screenTool) ctx.tools.register(screenTool({ client, trace, config, workspaceOf }))
+  if (config.tool) ctx.tools.register(systemOneTool({ client, trace, config, workspaceOf, writePolicyOf }))
+  if (config.screenTool) ctx.tools.register(screenTool({ client, trace, config, workspaceOf, writePolicyOf }))
 
   ctx.on('agent/disposed', ({ agent }) => {
     sessions.delete(agent?.session?.id)
@@ -760,10 +778,12 @@ export function apply(ctx, config) {
       const body = (removed ? verdict.text : screened) + tail
       let privacy
       if (masks && !spans && state && !state.privacyOff) {
-        // asked for, but no span model answers yet: said once a session, so nobody believes the data was masked
+        // asked for, but no span model answers: said once until privacy works again, so nobody believes the data was masked
         state.privacyOff = true
-        record(exec.agent.session, { reflex: 'privacy', ...target, verdict: 'error', error: `${config.spanModel} answers no span questions yet` })
+        const why = cardCheck?.failed ? `the models list could not be read (${cardCheck.failed}), so nothing was masked` : `${config.spanModel} answers no span questions yet`
+        record(exec.agent.session, { reflex: 'privacy', ...target, verdict: 'error', error: why })
       }
+      if (masks && spans && state) state.privacyOff = false
       let masking
       if (masks && spans) {
         masking = deciding(exec.agent.session, { reflex: 'privacy', ...target })
@@ -777,7 +797,7 @@ export function apply(ctx, config) {
             const answer = await client.ask({ model: config.spanModel, questions: PII_SPANS, inputs: batch.map(part => ({ state: part.text })), signal: exec.signal, timeoutMs: config.hookTimeoutMs, retries: config.hookRetries })
             model = answer.model
             batch.forEach((part, offset) => {
-              const marked = placeSpans(answer.spans[offset]?.pii, part.text, { min: config.privacyAt })
+              const marked = placeSpans(answer.spans[offset]?.pii, part.text, { min: config.privacyAt, overlaps: true })
                 .map(span => trimSpan(span, part.text))
                 .filter(span => span && personal(span, state?.user) && !notPersonal(span, part.text))
               for (const span of marked) found.push({ ...span, start: span.start + part.start, end: span.end + part.start })

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
 import http from 'node:http'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { registerHooks } from 'node:module'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
@@ -33,6 +33,8 @@ const PERSONAL = [
   // as vllm-sr/vela3-turbo does: a call's id taken for a name, an address with the commas around it, and the
   // placeholders of a redacted copy marked again
   ['C-\\d{4}', 'PERSON'], [', \\d+ Larch Road,', 'STREET_ADDRESS'], ['(?<=\\[)[A-Z_]{6,}(?=\\])', 'EMAIL_ADDRESS'],
+  // a name, and the address it starts, marked apart
+  ['Mara Lind', 'PERSON'], ['Lind@[a-z]+\\.example', 'EMAIL_ADDRESS'],
 ]
 const picked = (question, choice) => {
   const options = Object.keys(question.criteria)
@@ -118,7 +120,7 @@ function fakeDecisions() {
   })
 }
 
-async function setup(t, files = {}) {
+async function setup(t, files = {}, { writePolicyOf } = {}) {
   process.env.S1_TOOL_KEY = 'sk-vsr-test'
   const workspace = await mkdtemp(join(tmpdir(), 's1-tool-'))
   for (const [name, content] of Object.entries(files)) {
@@ -129,7 +131,7 @@ async function setup(t, files = {}) {
   const client = createDecisionClient({ baseURL: url, apiKeyEnv: 'S1_TOOL_KEY' })
   const traced = []
   const config = { toolName: 'system_one', model: 'vllm-sr/d3-ultra', spanModel: 'vllm-sr/vela3-turbo', toolMaxItems: 500, toolMaxChars: 4000, systemOneUi: 'card' }
-  const tool = systemOneTool({ client, trace: entry => traced.push(entry), config, workspaceOf: async () => workspace })
+  const tool = systemOneTool({ client, trace: entry => traced.push(entry), config, workspaceOf: async () => workspace, writePolicyOf })
   t.after(async () => {
     client.close()
     server.close()
@@ -734,4 +736,60 @@ test('redaction masks a marked string wherever it occurs in the item, in nested 
   const masked = rows.map(item => redactItem(item, item.text.includes('Dana') ? [{ label: 'PERSON', start: item.text.indexOf('Dana'), end: item.text.indexOf('Dana') + 9 }] : []).record)
   await writeRedacted({ file: join(dir, 'people.csv'), format: 'csv', output: join(dir, 'people.redacted.csv'), items: rows, records: masked })
   assert.equal(await readFile(join(dir, 'people.redacted.csv'), 'utf8'), 'name,note\n[PERSON],"[PERSON] said ""hi"", twice"\nLee,ok\n')
+})
+
+test('a redacted copy masks overlapping personal data as one: no part of the address is left', async t => {
+  const { workspace, run } = await setup(t, { 'notes.txt': 'Write to Mara Lind@lumen.example today.\nNothing personal here.\n' })
+  const value = await run({ questions: { personal: { preset: 'pii' } }, file: 'notes.txt', redact: true })
+  assert.equal(await readFile(join(workspace, 'notes.redacted.txt'), 'utf8'), 'Write to [PERSON] today.\nNothing personal here.\n')
+  const [row] = await readRows(value.output)
+  assert.equal(row.text, 'Write to [PERSON] today.')
+})
+
+const TEAM = { team: { type: 'choice', instructions: 'Which team handles it?', criteria: { billing: 'invoices and refunds', support: 'everything else' } } }
+const TICKETS = { 'tickets.jsonl': `${JSON.stringify({ id: 't1', body: 'The invoice is wrong!' })}\n${JSON.stringify({ id: 't2', body: 'How do I sign in?' })}\n` }
+
+test('in a read-only session the system_one tool writes no file: its answers stay in its result', async t => {
+  const { workspace, asked, run, rendered } = await setup(t, TICKETS, { writePolicyOf: async () => ({ mode: 'read-only', roots: [] }) })
+  const value = await run({ questions: TEAM, file: 'tickets.jsonl', redact: true, output: 'out/rows.csv' })
+  assert.equal(asked.length, 1, 'answered, without the personal-data question a copy would have added')
+  assert.deepEqual(Object.keys(asked[0].questions), ['team'])
+  assert.deepEqual([value.output, value.redacted, value.summary.team.counts], [undefined, undefined, { billing: 1, support: 1 }])
+  assert.deepEqual(await readdir(workspace), ['tickets.jsonl'])
+  const summary = rendered(value)
+  assert.match(summary, /Notes: no file written: this session is read-only, so the answers are in this result only\./)
+  assert.doesNotMatch(summary, /Results:/)
+  assert.match(summary, /First rows:\n {2}\{"id":"t1","team":"billing"/)
+})
+
+test('in a workspace-write session the system_one tool writes inside the workspace and refuses a path outside it before asking anything', async t => {
+  let policy
+  const { workspace, asked, run } = await setup(t, TICKETS, { writePolicyOf: async () => policy })
+  policy = { mode: 'workspace-write', workspace, roots: [workspace] }
+  const outside = await mkdtemp(join(tmpdir(), 's1-outside-'))
+  t.after(() => rm(outside, { recursive: true, force: true }))
+  await writeFile(join(outside, 'tickets.jsonl'), TICKETS['tickets.jsonl'])
+
+  const refused = [
+    [{ output: join(outside, 'rows.jsonl') }, `output ${join(outside, 'rows.jsonl')} is outside this session's workspace`],
+    [{ redact: join(outside, 'copy.jsonl') }, `redact ${join(outside, 'copy.jsonl')} is outside`],
+    // a file outside the workspace may be read, and its results do not go beside it
+    [{ file: join(outside, 'tickets.jsonl') }, `output ${join(outside, 'tickets.s1.jsonl')} is outside`],
+  ]
+  for (const [args, said] of refused) {
+    await assert.rejects(run({ questions: TEAM, file: 'tickets.jsonl', ...args }), error => error.message.startsWith(said) && error.message.includes(`(${workspace})`))
+  }
+  assert.equal(asked.length, 0, 'nothing was asked')
+  assert.deepEqual(await readdir(outside), ['tickets.jsonl'])
+
+  const read = await run({ questions: TEAM, file: join(outside, 'tickets.jsonl'), output: 'rows.jsonl', redact: 'tickets.redacted.jsonl' })
+  assert.deepEqual([read.output, read.redacted.output], [join(workspace, 'rows.jsonl'), join(workspace, 'tickets.redacted.jsonl')])
+  assert.equal((await readRows(read.output)).length, 2)
+  assert.deepEqual(await readdir(outside), ['tickets.jsonl'])
+
+  if (process.platform !== 'win32') {
+    await symlink(outside, join(workspace, 'elsewhere'))
+    await assert.rejects(run({ questions: TEAM, file: 'tickets.jsonl', output: 'elsewhere/rows.jsonl' }), /^Error: output elsewhere\/rows\.jsonl is outside this session's workspace/)
+    assert.deepEqual(await readdir(outside), ['tickets.jsonl'])
+  }
 })

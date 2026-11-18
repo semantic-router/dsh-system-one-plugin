@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { joined } from '../src/redact.js'
 import { excerpts, idAsData, labelCounts, maskLabel, notPersonal, onPlaceholder, placeSpans, replaceSpans, toCommands, toSentences, trimSpan, unnumber, windows } from '../src/spans.js'
 
 test('span offsets in code points land on the right UTF-16 range, even after an emoji', () => {
@@ -75,6 +76,19 @@ test('overlapping spans keep the more probable one', () => {
   assert.deepEqual(spans.map(span => span.label), ['B'])
 })
 
+test('personal data that overlaps is masked as one: a name marked inside an email address hides the whole address', () => {
+  const text = 'Email: john@example.com today'
+  const marked = [
+    { label: 'PERSON', start: 7, end: 11, text: 'john', probability: 0.97 },
+    { label: 'EMAIL_ADDRESS', start: 7, end: 23, text: 'john@example.com', probability: 0.9 },
+  ]
+  // the more probable span alone leaves the rest of the address readable
+  assert.equal(replaceSpans(text, placeSpans(marked, text), maskLabel), 'Email: [PERSON]@example.com today')
+  const both = placeSpans(marked, text, { overlaps: true })
+  assert.deepEqual(both.map(span => span.label), ['PERSON', 'EMAIL_ADDRESS'])
+  assert.equal(replaceSpans(text, joined(both), maskLabel), 'Email: [EMAIL_ADDRESS] today')
+})
+
 test('masking and excerpts: personal data becomes its label, and a hidden excerpt never carries it', () => {
   const text = 'From: Ada Lovelace <ada@example.com>\nPlease call 555-019-2837 about the invoice.'
   const spans = placeSpans([
@@ -146,4 +160,20 @@ test('windows end at line breaks and cover the whole text', () => {
   assert.ok(parts.every(part => part.text.length <= 60))
   assert.ok(parts.slice(0, -1).every(part => part.text.endsWith('\n')))
   assert.equal(parts[1].start, parts[0].text.length)
+})
+
+test('a line longer than a window is cut after a space, so an email address stays in one window, and never inside an emoji', () => {
+  const words = Array.from({ length: 30 }, (_, index) => `word${index}`).join(' ')
+  const text = `${words} grace.hopper@example.com ${words}`
+  const parts = windows(text, 200)
+  assert.equal(parts.map(part => part.text).join(''), text)
+  assert.ok(parts.every(part => part.text.length <= 200))
+  assert.ok(parts.slice(0, -1).every(part => part.text.endsWith(' ')), 'each window ends between words')
+  assert.equal(parts.filter(part => part.text.includes('grace.hopper@example.com')).length, 1)
+
+  // without a space or a line break to cut at, a cut still never splits a surrogate pair
+  const emoji = '😀'.repeat(150)
+  const cut = windows(emoji, 101)
+  assert.equal(cut.map(part => part.text).join(''), emoji)
+  assert.ok(cut.every(part => part.text.length <= 101 && !/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/.test(part.text)))
 })

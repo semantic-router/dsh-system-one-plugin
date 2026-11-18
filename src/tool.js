@@ -5,11 +5,12 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { REQUEST_TOKENS, compactAnswer, requestSlices, stateCost, unavailable, unavailableText } from './client.js'
 import { formatOf, loadItems } from './items.js'
 import { kindAt, mustBeFile, noFile } from './paths.js'
+import { deniedText, mayWrite } from './permissions.js'
 import { annotatePng, imageSize } from './png.js'
 import { ROUTER_SIGNALS, SENSITIVE_LABELS } from './questions.js'
 import { csvCell, everywhere, joined, redactItem, writeRedacted } from './redact.js'
 import { kindOf, planQuestions, readQuestions, splitArguments, unanswerable } from './rubric.js'
-import { excerpts, labelCounts, maskAround, notPersonal, placeSpans, trimSpan } from './spans.js'
+import { apart, excerpts, labelCounts, maskAround, notPersonal, placeSpans, trimSpan } from './spans.js'
 import { clip } from './trace.js'
 
 export { parseQuestions } from './rubric.js'
@@ -72,6 +73,12 @@ function defaultOutput(cwd, file, images) {
   const folders = [...new Set((images ?? []).map(path => dirname(path)))]
   const within = folders.length === 1 ? relative(cwd, folders[0]) : ''
   return within && !within.startsWith('..') && !isAbsolute(within) ? `${folders[0]}.s1.jsonl` : 'system-one-results.jsonl'
+}
+
+/** Where the annotated copy of one image goes: the file named, into the folder named, or beside the image. */
+function annotatedPath(annotateTo, item) {
+  const out = annotateTo.file ?? (annotateTo.beside ? item.path : join(annotateTo.dir, basename(item.path)))
+  return out === item.path ? `${out.slice(0, -extname(out).length)}.annotated.png` : out
 }
 
 /**
@@ -194,7 +201,7 @@ const listed = (entries, max = 8) => entries.slice(0, max).join(', ') + (entries
 function renderSummary(value) {
   const models = value.spanModel ? `${value.model} and ${value.spanModel}` : value.model
   const lines = [
-    `System One (${models}) answered ${value.questions} question(s) for ${value.items} item(s) in ${value.seconds} s (${value.requests} requests). Results: ${value.output}`,
+    `System One (${models}) answered ${value.questions} question(s) for ${value.items} item(s) in ${value.seconds} s (${value.requests} requests).${value.output ? ` Results: ${value.output}` : ''}`,
   ]
   // what the call was read as, where it was written another way, so a wrong reading can be put right
   if (value.notes?.length) lines.push(`Notes: ${value.notes.join('; ')}.`)
@@ -288,8 +295,10 @@ const round3 = value => Math.round(value * 1000) / 1000
  * @param {object} deps.config
  * @param {(exec: object) => Promise<string>} [deps.workspaceOf] - the calling session's working directory, which
  *   relative paths resolve against
+ * @param {(exec: object) => Promise<object | undefined>} [deps.writePolicyOf] - where the calling session lets tools
+ *   write (permissions.js `writePolicy`); undefined writes anywhere
  */
-export function systemOneTool({ client, trace, config, workspaceOf = async () => process.cwd() }) {
+export function systemOneTool({ client, trace, config, workspaceOf = async () => process.cwd(), writePolicyOf = async () => undefined }) {
   return defineTool({
     name: config.toolName,
     description: DESCRIPTION,
@@ -342,6 +351,18 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
       let questions = read.questions
       notes.push(...read.notes)
       const cwd = await workspaceOf(exec)
+      // A file goes only where DeepSeek Harness lets its own write tool write in this session: a read-only session keeps
+      // the answers in this result, and a path outside the workspace is refused before anything is asked.
+      const policy = await writePolicyOf(exec)
+      const readOnly = policy?.roots.length === 0
+      if (readOnly) notes.push(`no file written: ${policy.unknown ? 'this session\'s file policy could not be read' : 'this session is read-only'}, so the answers are in this result only`)
+      const pathShown = path => {
+        const inside = relative(cwd, path)
+        return inside && !inside.startsWith('..') && !isAbsolute(inside) ? inside : path
+      }
+      const allowed = async (path, what) => {
+        if (!(await mayWrite(policy, path))) throw new Error(deniedText(policy, what, pathShown(path)))
+      }
       const file = args.file ? resolve(cwd, args.file) : undefined
       if (file) await mustBeFile(cwd, args.file, 'file')
       // an image that is not there is left out, and said; a call none of whose images is there is refused
@@ -358,7 +379,7 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
       let output = resolve(cwd, args.output || defaultOutput(cwd, file, images))
       if ((await kindAt(output)) === 'directory' || /[\\/]$/.test(args.output ?? '')) output = join(output, basename(defaultOutput(cwd, file, images)))
       if (output === file) throw new Error('output is where the results go: give it a path other than the input file')
-      let copies = args.redact !== undefined && args.redact !== false && args.redact !== 'false' && args.redact !== null && args.redact !== ''
+      let copies = !readOnly && args.redact !== undefined && args.redact !== false && args.redact !== 'false' && args.redact !== null && args.redact !== ''
       const copyTo = !copies ? undefined : typeof args.redact === 'string' && args.redact !== 'true'
         ? resolve(cwd, args.redact)
         : file ? `${file.slice(0, file.length - extname(file).length)}.redacted${extname(file)}` : resolve(cwd, 'system-one-redacted.txt')
@@ -370,6 +391,7 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
         output = fallback
         notes.push(`output and redact named one file: the redacted copy is written there, the results to ${relative(cwd, output) || output}`)
       }
+      if (readOnly) output = undefined
       const items = await loadItems({
         file,
         items: args.items,
@@ -418,10 +440,15 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
       const model = args.model || config.model
       const spanModel = args.span_model || config.spanModel
       const { groups, asked } = planQuestions(questions, { model, spanModel, parts, images: hasImages })
+      // what gets masked (personal data, else what a redacted copy replaces) keeps the spans that overlap, so that their
+      // union is masked: a name marked inside an email address hides the whole address
+      const marks = Object.keys(questions).filter(id => asked[id].kind === 'span' && questions[id].preset !== 'halu' && questions[id].preset !== 'evidence')
+      const personalMarks = marks.filter(id => questions[id].preset === 'pii')
+      const masked = new Set(copies && personalMarks.length === 0 ? marks : personalMarks)
       const boxIds = Object.entries(questions).filter(([, question]) => question.type === 'box').map(([id]) => id)
       // where the annotated copies go: beside each image, into a folder, or (for one image) into a file
       let annotateTo
-      if (args.annotate !== undefined && args.annotate !== null && args.annotate !== false && args.annotate !== 'false' && args.annotate !== '') {
+      if (!readOnly && args.annotate !== undefined && args.annotate !== null && args.annotate !== false && args.annotate !== 'false' && args.annotate !== '') {
         if (!hasImages || boxIds.length === 0) {
           notes.push('nothing annotated: annotate draws the boxes that box questions find on images; add one, as {"where": {"type": "box", "instructions": "the spike, drop or flatline"}}')
         } else if (args.annotate === true || args.annotate === 'true') {
@@ -434,6 +461,9 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
           else annotateTo = { dir: to }
         }
       }
+      if (output) await allowed(output, 'output')
+      if (copies) await allowed(copyTo, 'redact')
+      if (annotateTo) for (const item of items) if (item.path) await allowed(annotatedPath(annotateTo, item), 'annotate')
       const context = args.context?.trim()
       const sources = grounded ? await readSources(sourcePaths, cwd, context) : undefined
 
@@ -509,7 +539,7 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
             const { state, shift } = states[index]
             const read = typeof state === 'string' ? state : state[entry.over] ?? ''
             const question = questions[id]
-            let spans = placeSpans(response.spans[offset]?.[wire], read, { min: question.threshold ?? (question.preset === 'halu' ? HALU_AT : question.preset === 'pii' ? config.privacyAt ?? PII_AT : 0) })
+            let spans = placeSpans(response.spans[offset]?.[wire], read, { min: question.threshold ?? (question.preset === 'halu' ? HALU_AT : question.preset === 'pii' ? config.privacyAt ?? PII_AT : 0), overlaps: masked.has(id) })
               .filter(span => span.start >= shift)
               .map(span => ({ ...span, start: span.start - shift, end: span.end - shift }))
             const kept = question.preset !== 'pii' || question.labels === 'all' ? undefined : question.labels ?? config.privacyLabels ?? SENSITIVE_LABELS
@@ -552,9 +582,7 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
       let redacted
       if (copies) {
         // personal data when the call looks for it, else what its own labels mark
-        const marks = Object.entries(questions).filter(([id, question]) => asked[id].kind === 'span' && question.preset !== 'halu' && question.preset !== 'evidence')
-        const personal = marks.filter(([, question]) => question.preset === 'pii')
-        const marking = (personal.length ? personal : marks).map(([id]) => id)
+        const marking = [...masked]
         const out = copyTo
         let spanCount = 0
         let changed = 0
@@ -566,6 +594,7 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
           if (copy.replaced) changed++
           return copy.record
         })
+        await allowed(out, 'redact')
         await mkdir(dirname(out), { recursive: true })
         await writeRedacted({ file, format: file ? formatOf(file) : 'lines', output: out, items, records })
         redacted = { output: out, items: changed, spans: spanCount }
@@ -574,6 +603,7 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
       let annotated
       if (annotateTo) {
         const dir = annotateTo.dir ?? dirname(annotateTo.file ?? items[0].path)
+        await allowed(dir, 'annotate')
         await mkdir(dir, { recursive: true })
         annotated = { dir, files: [], skipped: [] }
         for (const [index, item] of items.entries()) {
@@ -584,15 +614,18 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
             annotated.skipped.push(item.source)
             continue
           }
-          let out = annotateTo.file ?? (annotateTo.beside ? item.path : join(dir, basename(item.path)))
-          if (out === item.path) out = `${out.slice(0, -extname(out).length)}.annotated.png`
+          const out = annotatedPath(annotateTo, item)
+          await allowed(out, 'annotate')
           await writeFile(out, annotatePng(bytes, boxes.map(a => ({ box: a.box }))))
           annotated.files.push(relative(cwd, out) || out)
         }
       }
 
-      await mkdir(dirname(output), { recursive: true })
-      await writeResults(output, rows, questions, asked)
+      if (output) {
+        await allowed(output, 'output')
+        await mkdir(dirname(output), { recursive: true })
+        await writeResults(output, rows, questions, asked)
+      }
       const summary = summarize(questions, rows, asked)
 
       // for Chat: a few marked items per span question, and the images with their boxes
@@ -608,7 +641,7 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
         examples[id] = picked.map(({ item, index, spans }) => {
           let read = asked[id].over && typeof states[index].state === 'object' ? states[index].state[asked[id].over] : item.text
           // personal data wherever it recurs, as the redacted copy and the results file have it
-          let shown = kind === 'masked' ? joined(everywhere(read, spans)) : spans
+          let shown = kind === 'masked' ? joined(everywhere(read, spans)) : apart(spans)
           const personal = kind === 'labels' && personalIds.length ? personalOf(index) : []
           if (personal.length) ({ text: read, spans: shown } = maskAround(read, spans, read === item.text ? joined(everywhere(read, personal)) : personal))
           // evidence reads as a passage of its own file, or of the record's own context

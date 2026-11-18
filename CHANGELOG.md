@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.8.1 (2026-11-18)
+
+A security release: update now with `dsh plugin --profile web add @vllm-sr/dsh@0.8.1` (and `--profile headless`
+where you use it); a bare `@vllm-sr/dsh` installs it once it is a day old.
+
+- **The local trace no longer writes keys.** The trace (`~/.dsh/system-one/trace.jsonl`, on by default) records
+  your requests, the answers, the commands System One reviewed and the start of each tool result, and it redacted
+  them only after encoding them as JSON, with patterns anchored at a word boundary. So a key that followed a line
+  break (`\nsk-…`, as `cat .env` prints it), a key with dashes or underscores in it (`sk-ant-api03-…`, `sk-proj-…`),
+  an `Authorization` or `x-api-key` header, a cookie, and a value such as `OPENAI_API_KEY=…` or `"password": "…"`
+  were written to that file in clear text. Every earlier version is affected: `@vllm-sr/dsh` 0.3.0 to 0.8.0, and
+  `dsh-system-one` 0.2. Now every string is redacted before it is encoded: keys and tokens by their shape (`sk-…`,
+  `hf_…`, `ghp_…`, `github_pat_…`, `npm_…`, `glpat-…`, `xox…-`, AWS and Google keys, JWTs, private key blocks),
+  authorization headers and bearer tokens, cookies, credentials in URLs and their query parameters, and the values of
+  fields, variables and flags named for a key, token, secret or password, a value cut short included. The file is
+  made readable by you only even when it was there before with wider permissions, and on its first start 0.8.1
+  scrubs the trace at its configured path in place, once. **What to do:** update; delete any other copy of a trace
+  (a backup, a file at an earlier `trace` or `S1_TRACE` path, one attached to an issue); and if a trace has left your
+  machine, rotate every key it may hold: delete a System Duo key with its data on
+  [app.vllm-sr.ai](https://app.vllm-sr.ai)'s Keys page, remove `VLLM_SR_API_KEY` (and `DECISION_API_KEY`, if you
+  set one) from `~/.dsh/.credentials.yaml` and `~/.dsh/.env`, and the plugin gets a new key when it next starts;
+  rotate other providers' keys with those providers.
+- **Privacy no longer leaves part of what it found, and reads more tools.** Personal data marked twice over, as a
+  name inside an email address, is masked as one: until now only the more probable mark was masked and the rest
+  stayed (`[PERSON]@example.com`), in what System Two read and in a redacted copy. The default `privacyTools` adds
+  `pwsh` (Windows' shell), `job_output` (a background job's output), `grep` and `web_search`, whose results reached
+  System Two unmasked. A line longer than one request reads is cut after a space, never inside a word, an address or
+  an emoji. One failed request for the models list turned privacy off for ten minutes behind a notice that hid why;
+  the list is asked again after 15 seconds, and the notice names the reason.
+- **The tools write only where the session may.** The `system_one` tool's results, redacted copy and annotated
+  images, and `system_one_screen`'s annotated copy, were written with Node's own file API, so a read-only session,
+  or a path outside the workspace of a workspace-write session, got them anyway. They now follow DeepSeek Harness's
+  file policy for the session, as its own write tool does: `read-only` writes nothing and keeps the answers in the
+  tool's result, with a note; `workspace-write` refuses a path outside the workspace, its extra writable folders and
+  the temporary folders, a link that leads out included, before anything is asked; `danger-full-access` writes
+  anywhere.
+
 ## 0.8.0 (2026-11-12)
 
 - **vLLM Semantic Router routes on your words.** The router reads the last user message that has text, and the

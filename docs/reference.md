@@ -205,6 +205,12 @@ The results file holds one row per item: its id, its answers and the start of it
 `p_harm`, `r_harm` or `r_refusal` keeps ids and answers only, so reading the results brings none of the flagged
 words into System Two's context.
 
+The results, the redacted copy and the annotated images (of `system_one_screen` too) are written only where
+DeepSeek Harness lets its own write tool write in the session: under `read-only` nothing is written and the answers
+stay in the tool's result, with a note that says so; under `workspace-write` a path outside the session's workspace,
+its extra writable folders and the temporary folders is refused before anything is asked, a link that leads out
+included, so System Two can name another path; `danger-full-access` writes anywhere.
+
 ### Screens (`system_one_screen`)
 
 For computer use, System One is the eyes of each step. System Two gives it one screenshot and asks:
@@ -367,8 +373,12 @@ session's random id (`x-session-id`, `x-conversation-id`; `routerSession: false`
 [terms](https://app.vllm-sr.ai/terms) and [privacy](https://app.vllm-sr.ai/privacy) pages before you use it with
 private code or data. Each reflex can be turned off.
 
-The local trace (`~/.dsh/system-one/trace.jsonl`, readable by you only) records every decision with its probabilities
-and redacts secret-shaped strings; it never records keys. Set `trace: off` to disable it.
+The local trace (`~/.dsh/system-one/trace.jsonl`, readable by you only) records every decision with its probabilities.
+Every string is redacted before it is written: keys and tokens by their shape (`sk-…`, `hf_…`, `ghp_…`, `npm_…`,
+JWTs, private key blocks), authorization headers, cookies, credentials in URLs, and the values of fields, variables
+and flags named for a key, token, secret or password (`DECISION_API_KEY=…`, `"api_key": …`, `--token …`). A trace
+that an earlier version wrote is scrubbed the same way, once, when the plugin starts (its first line then says so).
+Set `trace: off` to disable it.
 
 For the Web UI, each decision is also written to the session's own log as a plugin record
 (`plugin:vllm-sr/dsh/system-one`): its answers, model, latency and verdict, and the reviewed call in short with
@@ -416,7 +426,7 @@ Every field has a default. Set any of them on the `system-one` row of a profile 
     privacy: true                  # mask personal data before System Two reads it; false turns it off
     privacyAt: 0.5                 # the lowest probability of a personal-data span that is masked
     privacyLabels: [PERSON, EMAIL_ADDRESS, PHONE_NUMBER, STREET_ADDRESS, CREDIT_CARD, IBAN_CODE, US_SSN, US_DRIVER_LICENSE, IP_ADDRESS]
-    privacyTools: [web_fetch, bash, read]
+    privacyTools: [web_fetch, bash, read, pwsh, job_output, grep, web_search]
     screenTool: true               # the system_one_screen tool, for computer use
     screenModel: vllm-sr/vela3-turbo
     llmProvider: vllm-sr           # the provider route of System Two's requests through the router
@@ -431,7 +441,11 @@ form they were recorded with. The tool's custom row is drawn for the default `to
 
 With privacy on (the default), System Two sees `[LABEL]` placeholders instead of personal data in the results of
 `privacyTools`, so it cannot copy a real value into a file it writes from what it read; it is told to ask you
-instead. Placeholders already in a result, as in a redacted copy, are left as they are, and so are their bare names
+instead. Personal data marked twice over, as a name inside an email address, is masked as one, in a redacted copy too.
+A line longer than one request reads is cut after a space, so an address or a number stays whole. If the models list
+that says which model answers span questions cannot be read, privacy cannot mask: the session says so once, with the
+reason, and the list is asked again 15 seconds later. Placeholders already in a result, as in a redacted copy, are
+left as they are, and so are their bare names
 (`'CREDIT_CARD'` in a list), ids such as `m01`, sizes such as `960x540` and file paths that the span model takes for
 names, numbers or addresses. Span records keep labels
 and offsets of personal data, never the data itself. A guard or done-check model

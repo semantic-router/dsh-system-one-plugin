@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import http from 'node:http'
 import { registerHooks } from 'node:module'
-import { userInfo } from 'node:os'
+import { tmpdir, userInfo } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
+import { setTimeout as sleep } from 'node:timers/promises'
 import { RECORD_TYPE, approvalOutcome, createRecorder, failureOf, jsonSafe, relativeTo } from '../src/records.js'
 
 // The DeepSeek Harness packages index.js imports come from the harness at run time; here they are small stand-ins.
@@ -78,8 +82,9 @@ test('the system_one tool keeps its result facts for the Web UI row', async () =
   assert.deepEqual(presentation(value, 'off'), { systemOne: 1, ui: 'off' })
 })
 
-// A decision service that answers each reflex's questions the way the real models would for these inputs.
-function fakeDecisions({ delayMs = 0 } = {}) {
+// A decision service that answers each reflex's questions the way the real models would for these inputs; its models
+// list answers 503 the first `modelsDown` times.
+function fakeDecisions({ delayMs = 0, modelsDown = 0 } = {}) {
   const asked = []
   // per request: the model, and the question ids of its first entry and of each more entry
   const requests = []
@@ -126,7 +131,8 @@ function fakeDecisions({ delayMs = 0 } = {}) {
         // like the real model, it also takes a file's owner and group, the machine's account, for one person, a home
         // directory for its owner, the placeholders of a redacted copy for what they replaced, and ids for people
         const account = userInfo().username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-        out[id] = [...spansIn(state, '[a-z]+@example\\.com', 'EMAIL_ADDRESS'), ...spansIn(state, '\\d{3}-\\d{3}-\\d{4}', 'PHONE_NUMBER'), ...spansIn(state, 'Ada Lovelace', 'PERSON'), ...spansIn(state, 'Acme Corp', 'ORGANIZATION'), ...spansIn(state, ` ${account} ${account} `, 'PERSON').map(span => ({ ...span, start: span.start + 1, end: span.end - 1, text: span.text.trim() })), ...spansIn(state, '/home/[A-Za-z0-9_.-]+', 'PERSON'), ...spansIn(state, '\\b\\d{1,3}(?:\\.\\d{1,3}){3}\\b', 'IP_ADDRESS'), ...spansIn(state, '(?<=\\[)[A-Z_]{6,}(?=\\])', 'PERSON'), ...spansIn(state, "(?<=')m\\d{2}(?=')", 'PERSON'), ...spansIn(state, "(?<=')EMAIL_ADDRESS(?=')", 'EMAIL_ADDRESS')]
+        // and, surer of it, the name that starts an email address for a person on its own
+        out[id] = [...spansIn(state, '\\bgrace(?=@)', 'PERSON').map(span => ({ ...span, probability: 0.99 })), ...spansIn(state, '[a-z]+@example\\.com', 'EMAIL_ADDRESS'), ...spansIn(state, '\\d{3}-\\d{3}-\\d{4}', 'PHONE_NUMBER'), ...spansIn(state, 'Ada Lovelace', 'PERSON'), ...spansIn(state, 'Acme Corp', 'ORGANIZATION'), ...spansIn(state, ` ${account} ${account} `, 'PERSON').map(span => ({ ...span, start: span.start + 1, end: span.end - 1, text: span.text.trim() })), ...spansIn(state, '/home/[A-Za-z0-9_.-]+', 'PERSON'), ...spansIn(state, '\\b\\d{1,3}(?:\\.\\d{1,3}){3}\\b', 'IP_ADDRESS'), ...spansIn(state, '(?<=\\[)[A-Z_]{6,}(?=\\])', 'PERSON'), ...spansIn(state, "(?<=')m\\d{2}(?=')", 'PERSON'), ...spansIn(state, "(?<=')EMAIL_ADDRESS(?=')", 'EMAIL_ADDRESS')]
       } else if (question.preset === 'halu') {
         out[id] = state.context.includes('MIT') ? [] : spansIn(state.answer, 'MIT licensed', 'unsupported')
       } else if (question.type === 'span' && question.over === 'context') {
@@ -145,6 +151,11 @@ function fakeDecisions({ delayMs = 0 } = {}) {
       request.on('data', chunk => chunks.push(chunk))
       request.on('end', () => {
         if (request.url === '/v1/systemone/models') {
+          if (modelsDown > 0) {
+            modelsDown--
+            response.writeHead(503, { 'content-type': 'application/json' })
+            return response.end(JSON.stringify({ error: { code: 'unavailable', message: 'try again' } }))
+          }
           return response.end(JSON.stringify({ data: [{ id: 'vllm-sr/d3-ultra', question_types: ['choice', 'noul', 'score'] }, { id: 'vllm-sr/vela3-turbo', question_types: ['choice', 'noul', 'score', 'span'], presets: ['pii', 'halu'] }] }))
         }
         if (request.url !== '/v1/decisions') return response.end('{}')
@@ -711,6 +722,96 @@ test('spans stay off while the span model does not list them', async t => {
   assert.deepEqual([warned.reflex, warned.verdict, warned.error], ['privacy', 'error', 'vllm-sr/vela3-flash answers no span questions yet'])
   await handlers.get('tools/post-execute')({ name: 'bash', callId: 'p2', arguments: { command: 'cat y' }, agent }, { isError: false, content: [{ type: 'text', text: output }] }, async () => ({ kind: 'accept' }))
   assert.equal(agent.session.records.filter(entry => entry.data.reflex === 'privacy').length, 1, 'said once a session')
+})
+
+const PRIVACY = { spans: 'auto', spanModel: 'vllm-sr/vela3-turbo', shield: false, triage: false, privacy: true, privacyTools: ['bash'], privacyAt: 0.5, privacyLabels: ['PERSON', 'EMAIL_ADDRESS'] }
+const contacts = (handlers, agent, callId) => handlers.get('tools/post-execute')(
+  { name: 'bash', callId, arguments: { command: 'cat contacts.txt' }, agent },
+  { isError: false, content: [{ type: 'text', text: 'Reply to grace@example.com by Friday.' }] },
+  async () => ({ kind: 'accept', untouched: true }),
+)
+
+test('privacy masks overlapping personal data as one: a name marked inside an email address hides the whole address', async t => {
+  process.env.S1_RECORDS_KEY = 'sk-vsr-test'
+  const { server, url } = await fakeDecisions()
+  const plugin = await import('../src/index.js')
+  const { ctx, config, handlers, agent, close } = harness(url, PRIVACY)
+  t.after(() => {
+    close()
+    server.close()
+  })
+  plugin.apply(ctx, config)
+  const result = await contacts(handlers, agent, 'p1')
+  assert.ok(result.content[0].text.endsWith('\n\nReply to [EMAIL_ADDRESS] by Friday.'), result.content[0].text)
+  assert.doesNotMatch(result.content[0].text, /example\.com/)
+  assert.deepEqual(agent.session.records.at(-1).data.labels, { PERSON: 1, EMAIL_ADDRESS: 1 })
+})
+
+test('a models list that could not be read turns privacy off for seconds, not ten minutes, and says why', async t => {
+  process.env.S1_RECORDS_KEY = 'sk-vsr-test'
+  const { server, url } = await fakeDecisions({ modelsDown: 1 })
+  const plugin = await import('../src/index.js')
+  const { ctx, config, handlers, agent, close } = harness(url, PRIVACY)
+  t.after(() => {
+    close()
+    server.close()
+  })
+  plugin.apply(ctx, config)
+  assert.equal((await contacts(handlers, agent, 'p1')).untouched, true)
+  const said = agent.session.records.at(-1).data
+  assert.deepEqual([said.reflex, said.verdict, said.error], ['privacy', 'error', 'the models list could not be read (Decision API 503), so nothing was masked'])
+  // 16 seconds later the list is asked again, and privacy masks
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() + 16000 })
+  const later = await contacts(handlers, agent, 'p2')
+  assert.ok(later.content[0].text.endsWith('Reply to [EMAIL_ADDRESS] by Friday.'), later.content[0].text)
+  assert.equal(agent.session.records.at(-1).data.verdict, 'masked')
+})
+
+test('privacy reads every tool that brings a file\'s, a shell\'s or the web\'s text in, Windows\' pwsh too, as the reference says', async () => {
+  const { Config } = await import('../src/index.js')
+  const tools = Config.shape.privacyTools.fallback
+  assert.deepEqual(tools, ['web_fetch', 'bash', 'read', 'pwsh', 'job_output', 'grep', 'web_search'])
+  assert.ok(readFileSync(new URL('../docs/reference.md', import.meta.url), 'utf8').includes(`privacyTools: [${tools.join(', ')}]`))
+})
+
+// no eight characters in a row of a secret's own part
+function holdsNone(text, secret) {
+  for (let at = 0; at + 8 <= secret.length; at++) if (text.includes(secret.slice(at, at + 8))) return false
+  return true
+}
+
+test('the trace holds no key: not the request\'s, a reviewed command\'s, a tool result\'s or the answer\'s', async t => {
+  process.env.S1_RECORDS_KEY = 'sk-vsr-test'
+  const { server, url } = await fakeDecisions()
+  const plugin = await import('../src/index.js')
+  const dir = await mkdtemp(join(tmpdir(), 's1-trace-'))
+  const path = join(dir, 'system-one', 'trace.jsonl')
+  const { ctx, config, handlers, agent, close } = harness(url, { trace: path })
+  t.after(async () => {
+    close()
+    server.close()
+    await rm(dir, { recursive: true, force: true })
+  })
+  plugin.apply(ctx, config)
+  // secrets' own parts: after their prefixes, with the dashes and underscores real keys carry
+  const own = { vsr: 'Vq7xT2Rk9sWd4mQb8LzA', proj: 'Lm3_Np-8Hx2_Kd-5Wq7Z', ant: 'Zz9-Yy_8Xw7-Vu_6Ts5R', bearer: 'Kq2Wd8RtPz5Lm1Nx', cookie: 'Hc4Jd7Fg2Kp9Rs3T' }
+  const user = { role: 'user', content: [{ type: 'text', text: `Deploy it with OPENAI_API_KEY=sk-proj-${own.proj} and this key:\nsk-vsr-${own.vsr}` }], source: { kind: 'user' } }
+  await handlers.get('agent/pre-step')({ agent, messages: [user], turn: 1, step: 1 }, async () => ({ kind: 'enter', messages: [] }))
+  await handlers.get('tools/pre-execute')({ name: 'bash', callId: 'c1', arguments: { command: `curl -H "Authorization: Bearer ${own.bearer}" -H 'Cookie: sid=${own.cookie}' https://api.example/v1` }, agent }, async () => ({ kind: 'allow' }))
+  handlers.get('tools/result')({ name: 'bash', callId: 'c2', arguments: { command: 'cat .env' }, agent }, { isError: false, content: [{ type: 'text', text: `# keys\nANTHROPIC_API_KEY=sk-ant-api03-${own.ant}\nsk-vsr-${own.vsr}` }] })
+  handlers.get('session/event')(agent.session, { type: 'assistant/message', data: { turn: 1, step: 2, message: { content: [{ type: 'text', text: `Done. Your key\nsk-vsr-${own.vsr} works.` }] } } })
+
+  let written = ''
+  for (let tries = 0; tries < 200 && !written.includes('"ev":"assistant"'); tries++) {
+    await sleep(10)
+    written = await readFile(path, 'utf8').catch(() => '')
+  }
+  for (const [name, secret] of Object.entries(own)) assert.ok(holdsNone(written, secret), `no part of the ${name} key in the trace`)
+  const lines = written.trim().split('\n').map(line => JSON.parse(line))
+  assert.deepEqual([lines[0].ev, lines[0].redaction], ['trace', 1])
+  assert.deepEqual(['user', 's1', 'result', 'assistant'].filter(ev => !lines.some(line => line.ev === ev)), [], 'every step is still traced')
+  assert.equal(lines.find(line => line.ev === 'user').text, 'Deploy it with OPENAI_API_KEY=[redacted] and this key:\n[redacted]')
+  assert.match(lines.find(line => line.reflex === 'guard').call, /^curl -H "Authorization: \[redacted\]" -H 'Cookie: \[redacted\]' https:\/\/api\.example\/v1$/)
 })
 
 test('systemOneUi off writes no records and keeps the reflexes working', async t => {
