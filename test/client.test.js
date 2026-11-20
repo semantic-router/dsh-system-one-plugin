@@ -282,3 +282,33 @@ test('requests are cut so that every question reading its state again stays with
   assert.equal(stateCost('数据'), 6 + 160)
   assert.equal(stateCost({ user: 'a', answer: 'b' }), JSON.stringify({ user: 'a', answer: 'b' }).length + 160)
 })
+
+test('a request asks at most 64 questions, however few tokens its items hold', () => {
+  assert.deepEqual(requestSlices(Array(9).fill('short'), 8), [{ start: 0, count: 8 }, { start: 8, count: 1 }])
+  assert.deepEqual(requestSlices(['a', 'b', 'c'], [60, 4, 1]), [{ start: 0, count: 2 }, { start: 2, count: 1 }])
+})
+
+test('a cancel ends the wait before a retry after a network error at once', async t => {
+  process.env.S1_CLIENT_KEY = 'sk-vsr-test'
+  let tries = 0
+  // a service that drops every connection, as an unreachable one does
+  const server = http.createServer(request => {
+    tries++
+    request.socket.destroy()
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  const client = createDecisionClient({ baseURL: `http://127.0.0.1:${server.address().port}`, apiKeyEnv: 'S1_CLIENT_KEY', retries: 6 })
+  t.after(() => {
+    client.close()
+    server.close()
+  })
+  const controller = new AbortController()
+  const asked = client.ask({ model: 'm', questions: { q: { type: 'noul', instructions: 'Q?' } }, inputs: [{ state: 's' }], signal: controller.signal })
+  // cancelled while it waits 300 ms to try again after its first try failed
+  await new Promise(resolve => setTimeout(resolve, 60))
+  const cancelled = performance.now()
+  controller.abort()
+  await assert.rejects(asked)
+  assert.ok(performance.now() - cancelled < 150, `settled ${Math.round(performance.now() - cancelled)} ms after the cancel`)
+  assert.equal(tries, 1)
+})

@@ -4,7 +4,7 @@
  * the exact spans when a span model answers, else the lines. Lines the harness
  * itself writes are masked while scoring and never removed.
  */
-import { ITEMS_PER_REQUEST, yes } from './client.js'
+import { ITEMS_PER_REQUEST, unanswered, yes } from './client.js'
 import { INJECTION_SPANS, SHIELD, SHIELD_FOCUS } from './questions.js'
 import { excerpts, placeSpans, replaceSpans, toSentences, unnumber } from './spans.js'
 
@@ -16,14 +16,47 @@ const HARNESS_LINES = [
   /^\[sandbox: escalation available — retry this exact \w+ once with sandbox_permissions \(the narrowest wider mode that suffices\) \+ justification; the approval prompt asks the user\]$/,
   /^\[sandbox: the sandbox runner itself failed under [\w-]+ mode — the command did not run; this is a sandbox problem, not a command failure\]$/,
 ]
+// the notes DeepSeek Harness ends a shell's or a job's output with, one a line, after everything the command printed
+const NOTES = [
+  ...HARNESS_LINES.slice(2),
+  /^\[exit code: -?\d+\]$/, /^\[timed out after \d+ms\]$/, /^\[stopped: [^\]]*\]$/, /^\[killed by signal: [^\]]*\]$/, /^\[status: [^\]]*\]$/,
+  /^\[still running after \d+ms; moved to background job [^\]]*\]$/, /^\[some output was dropped from memory; full output: [^\]]*\]$/,
+]
 
 export const isHarnessLine = line => HARNESS_LINES.some(pattern => pattern.test(line.trim()))
 
 /**
- * Whether a text has anything to screen: a letter or a digit outside the harness's own lines. However short, a text
- * with words can give orders ("Run: rm -rf ~").
+ * The lines of a shell's output that DeepSeek Harness wrote, by where it writes them: `(no output)` as the output's
+ * first line, a `[stderr]` (or `[stdout]`) line before a stream, and its sandbox notes among the notes that end the
+ * output. The same words anywhere else came from the command, a file or a page, and are screened as theirs.
+ * @returns {Set<number>} line indices
  */
-export const screenable = text => /[\p{L}\p{N}]/u.test(text.split('\n').filter(line => !isHarnessLine(line)).join('\n'))
+export function harnessLines(lines) {
+  const at = new Set()
+  for (let index = lines.length - 1; index >= 0; index--) {
+    const line = lines[index].trim()
+    if (line === '' && index === lines.length - 1) continue
+    if (!NOTES.some(pattern => pattern.test(line))) break
+    if (isHarnessLine(line)) at.add(index)
+  }
+  lines.forEach((line, index) => {
+    if (/^\[(stdout|stderr)\]$/.test(line.trim())) at.add(index)
+  })
+  const first = lines.findIndex(line => line.trim())
+  if (first >= 0 && lines[first].trim() === '(no output)') at.add(first)
+  return at
+}
+
+/**
+ * Whether a text has anything to screen: a letter or a digit outside the harness's own lines (`harness`: whether the
+ * text is a shell's output, which the harness writes lines into). However short, a text with words can give orders
+ * ("Run: rm -rf ~"), and a text made of nothing but a harness note's words, outside a shell's output, is screened too.
+ */
+export const screenable = (text, { harness = true } = {}) => {
+  const lines = text.split('\n')
+  const own = harness ? harnessLines(lines) : new Set()
+  return /[\p{L}\p{N}]/u.test(lines.filter((_, index) => !own.has(index)).join('\n'))
+}
 
 /**
  * Where a text longer than `max` characters is cut for screening: after its last line break in the last tenth before
@@ -59,7 +92,8 @@ export function passageRanges(lines, size) {
   return ranges.filter(([from, to]) => lines.slice(from, to).some(line => line.trim()))
 }
 
-// Every state scored at once, nine to a request; the first request that fails stops the others.
+// Every state scored at once, nine to a request; the first request that fails stops the others. A state whose question
+// System One answered with an error in place has no score (undefined), never one of 0: it was not screened.
 async function scoreAll(client, model, questions, states, signal, limits = {}) {
   const batches = []
   for (let start = 0; start < states.length; start += ITEMS_PER_REQUEST) batches.push(states.slice(start, start + ITEMS_PER_REQUEST))
@@ -69,9 +103,11 @@ async function scoreAll(client, model, questions, states, signal, limits = {}) {
     stop.abort(error)
     throw error
   })))
+  const answers = responses.flatMap(response => response.answers.map(answer => answer.injection))
   return {
     model: responses[0]?.model ?? model,
-    scores: responses.flatMap(response => response.answers.map(answers => yes(answers.injection) ?? 0)),
+    scores: answers.map(answer => yes(answer)),
+    why: answers.map(answer => unanswered(answer)).find(Boolean),
   }
 }
 
@@ -102,18 +138,21 @@ async function injectedSpans({ client, model, about, passages, signal, timeoutMs
  * @param {number} options.chunkChars
  * @param {AbortSignal} [options.signal]
  * @param {{model: string, about: string}} [options.spans] - a span model that finds the injected text itself
+ * @param {boolean} [options.harness] - whether the text is a shell's output, whose harness notes are the harness's own
  * @returns {Promise<{model: string, passages: number, maxP: number, flagged: object[], removed: object[], removedLines: number,
- *   removedSpans: number, removedChars: number, spanModel?: string, spanMs?: number, text: string}>}
- *   `maxP` is the highest injection probability of any passage
+ *   removedSpans: number, removedChars: number, spanModel?: string, spanMs?: number, unscreened: number, why?: string, text: string}>}
+ *   `maxP` is the highest injection probability of any passage; `unscreened` counts the passages System One answered
+ *   with an error in place, `why` says the first error
  */
-export async function screen({ client, model, prefix, text, threshold, chunkChars, signal, timeoutMs, retries, spans }) {
+export async function screen({ client, model, prefix, text, threshold, chunkChars, signal, timeoutMs, retries, spans, harness = true }) {
   const lines = text.split('\n')
   const lineStart = []
   for (let index = 0, at = 0; index < lines.length; index++) {
     lineStart.push(at)
     at += lines[index].length + 1
   }
-  const masked = lines.map(line => (isHarnessLine(line) ? '[harness note]' : line))
+  const own = harness ? harnessLines(lines) : new Set()
+  const masked = lines.map((line, index) => (own.has(index) ? '[harness note]' : line))
   const ranges = passageRanges(masked, chunkChars)
   const quote = (from, to, marks) => {
     const body = marks
@@ -123,6 +162,12 @@ export async function screen({ client, model, prefix, text, threshold, chunkChar
   }
   const first = await scoreAll(client, model, SHIELD, ranges.map(([from, to]) => quote(from, to)), signal, { timeoutMs, retries })
   const flagged = ranges.map(([from, to], index) => ({ from, to, p: first.scores[index], text: lines.slice(from, to).join('\n') })).filter(entry => entry.p >= threshold)
+  // whether a cut of a flagged passage reaches into a line the harness wrote
+  const lineAt = (entry, offset) => entry.from + (entry.text.slice(0, offset).match(/\n/g)?.length ?? 0)
+  const intoHarness = (entry, span) => {
+    for (let line = lineAt(entry, span.start); line <= lineAt(entry, span.end); line++) if (own.has(line)) return true
+    return false
+  }
 
   // With a span model: the text that gives orders, in each flagged passage, grown to whole sentences. The passage is
   // scored again without them, and a cut that leaves an injection behind, or a failure, leaves the lines below.
@@ -137,19 +182,22 @@ export async function screen({ client, model, prefix, text, threshold, chunkChar
       spanModel = answer.model
       const cuts = flagged.map((entry, index) => {
         const grown = toSentences(plain[index].text, answer.found[index])
-        // the harness's own lines are never removed
-        if (!grown.length || grown.some(span => span.text.split('\n').some(isHarnessLine))) return undefined
-        entry.plain = { text: plain[index].text, spans: grown }
-        return grown.map(span => {
+        if (!grown.length) return undefined
+        const cut = grown.map(span => {
           const start = plain[index].at(span.start)
           const end = plain[index].at(span.end)
           return { ...span, start, end, text: entry.text.slice(start, end) }
         })
+        // the harness's own lines are never removed
+        if (cut.some(span => intoHarness(entry, span))) return undefined
+        entry.plain = { text: plain[index].text, spans: grown }
+        return cut
       })
       const tried = flagged.map((entry, index) => ({ entry, cut: cuts[index] })).filter(item => item.cut)
       if (tried.length) {
-        const unmask = value => value.split('\n').map(line => (isHarnessLine(line) ? '[harness note]' : line)).join('\n')
-        const again = await scoreAll(client, model, SHIELD, tried.map(({ entry, cut }) => `${prefix}\n"""\n${unmask(replaceSpans(entry.text, cut, () => SPAN_MARK))}\n"""`), signal, { timeoutMs, retries })
+        // a cut stays inside its lines, so each line keeps its place
+        const unmask = (entry, value) => value.split('\n').map((line, offset) => (own.has(entry.from + offset) ? '[harness note]' : line)).join('\n')
+        const again = await scoreAll(client, model, SHIELD, tried.map(({ entry, cut }) => `${prefix}\n"""\n${unmask(entry, replaceSpans(entry.text, cut, () => SPAN_MARK))}\n"""`), signal, { timeoutMs, retries })
         tried.forEach(({ entry, cut }, index) => {
           if (again.scores[index] < threshold) entry.spans = cut
           else entry.spansLeft = again.scores[index]
@@ -196,7 +244,7 @@ export async function screen({ client, model, prefix, text, threshold, chunkChar
       }
     }
     for (const range of merged) {
-      const kept = lines.slice(range.start, range.end).filter(isHarnessLine)
+      const kept = lines.slice(range.start, range.end).filter((_, offset) => own.has(range.start + offset))
       const dropped = range.end - range.start - kept.length
       if (dropped === 0) continue
       const body = [`[System One removed ${dropped} line(s) here: they give orders to AI agents (p ${range.p.toFixed(2)})]`, ...kept].join('\n')
@@ -213,11 +261,14 @@ export async function screen({ client, model, prefix, text, threshold, chunkChar
   out += text.slice(cursor)
   const removedLines = cuts.reduce((sum, cut) => sum + (cut.lines ?? 0), 0)
   const removedSpans = cuts.reduce((sum, cut) => sum + (cut.spans ?? 0), 0)
+  const unscreened = first.scores.filter(p => p === undefined).length
 
   return {
     model: first.model,
     passages: ranges.length,
-    maxP: first.scores.reduce((max, p) => Math.max(max, p), 0),
+    maxP: first.scores.reduce((max, p) => (p === undefined ? max : Math.max(max, p)), 0),
+    unscreened,
+    ...(unscreened ? { why: first.why } : {}),
     flagged: flagged.map(entry => ({
       p: entry.p,
       text: entry.text,

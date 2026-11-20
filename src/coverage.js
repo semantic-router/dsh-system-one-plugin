@@ -19,6 +19,10 @@ export const GUARD_TOOLS = ['bash', 'pwsh', 'write', 'edit', 'apply_patch', 'str
 // named, as a masked name in a path would leave System Two unable to open the file
 export const PRIVACY_TOOLS = ['web_fetch', 'bash', 'read', 'pwsh', 'job_output', 'grep', 'web_search', 'str_replace_editor']
 
+// the tools whose results DeepSeek Harness writes lines of its own into (a stream's marker, a sandbox note): a shell's
+// output and a background job's; in any other tool's result such a line is the text's own (shield.js `harnessLines`)
+export const HARNESS_NOTED = new Set(['bash', 'pwsh', 'job_output'])
+
 /** A test of a tool's name against a list of names, where `name*` stands for every name that starts with `name`. */
 export function toolMatcher(names) {
   const exact = new Set()

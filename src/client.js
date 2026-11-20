@@ -13,6 +13,9 @@ import { setTimeout as sleep } from 'node:timers/promises'
 /** Inputs answered by one request: one as a standard request, more as a batch with an entry each. */
 export const ITEMS_PER_REQUEST = 9
 
+/** Questions one request may ask, over all its inputs together: the Decision API's `max_questions`. */
+export const QUESTIONS_PER_REQUEST = 64
+
 /**
  * The input tokens a request may estimate, with room to spare: the Decision API counts every question as reading its
  * state again, about one token per UTF-8 byte, and refuses a request over the model's `max_request_tokens` (131,072
@@ -25,7 +28,7 @@ export const stateCost = state => Buffer.byteLength(typeof state === 'string' ? 
 
 /**
  * Consecutive slices of `states`, at most {@link ITEMS_PER_REQUEST} each, whose `questions` questions per state (one
- * number for all, or one for each state) stay within {@link REQUEST_TOKENS}.
+ * number for all, or one for each state) stay within {@link REQUEST_TOKENS} and {@link QUESTIONS_PER_REQUEST}.
  * @returns {Array<{start: number, count: number}>}
  */
 export function requestSlices(states, questions) {
@@ -35,10 +38,12 @@ export function requestSlices(states, questions) {
   while (start < states.length) {
     let count = 0
     let cost = 0
+    let asked = 0
     while (start + count < states.length && count < ITEMS_PER_REQUEST) {
       const next = stateCost(states[start + count]) * asks(start + count)
-      if (count > 0 && cost + next > REQUEST_TOKENS) break
+      if (count > 0 && (cost + next > REQUEST_TOKENS || asked + asks(start + count) > QUESTIONS_PER_REQUEST)) break
       cost += next
+      asked += asks(start + count)
       count++
     }
     slices.push({ start, count })
@@ -172,7 +177,8 @@ export function createDecisionClient(options) {
       } catch (error) {
         if (signal?.aborted) throw error
         if (attempt < maxRetries) {
-          await sleep(300 * 2 ** attempt)
+          // a cancel ends the wait at once, as it ends one for a spent budget below
+          await sleep(300 * 2 ** attempt, undefined, signal ? { signal } : undefined)
           continue
         }
         throw new DecisionError(`Decision API unreachable: ${error.message}`, 0, 'network')
@@ -260,7 +266,14 @@ export function createDecisionClient(options) {
     return Array.isArray(cards) ? cards : []
   }
 
-  return { ask, warm, models, hasKey: async () => Boolean(await apiKey()), close: () => agent.destroy() }
+  /** The published limits (no key needed): `{limits, models: [{id, limits}]}`, each model's own beside the defaults. */
+  async function info(signal) {
+    const response = await send('/api/info', 'GET', undefined, { accept: 'application/json' }, signal ?? AbortSignal.timeout(timeoutMs))
+    if (response.status !== 200) throw new DecisionError(`Decision API ${response.status} reading its limits`, response.status)
+    return JSON.parse(response.text)
+  }
+
+  return { ask, warm, models, info, hasKey: async () => Boolean(await apiKey()), close: () => agent.destroy() }
 }
 
 /**
@@ -318,6 +331,27 @@ export function unavailableText(error) {
 /** Probability that a noul answer is yes, or undefined when the question failed. */
 export function yes(answer) {
   return typeof answer?.noul === 'number' ? answer.noul : undefined
+}
+
+/**
+ * Why a question has no answer: the error System One gave in its place (`invalid_question: why`), as a request that
+ * succeeds may answer one question so beside the others, or `no answer` when it is missing; undefined when it was
+ * answered.
+ */
+export function unanswered(answer) {
+  if (answer && typeof answer === 'object' && answer.error === undefined) {
+    if (typeof answer.noul === 'number' || typeof answer.score === 'number' || typeof answer.choice === 'string' || (answer.box && typeof answer.box === 'object')) return undefined
+  }
+  const error = answer?.error && typeof answer.error === 'object' ? answer.error.code ?? answer.error.message : answer?.error
+  const said = [error, answer?.reason].filter(value => typeof value === 'string' && value.trim()).join(': ')
+  return said ? said.replace(/\s+/g, ' ').trim().slice(0, 200) : 'no answer'
+}
+
+/** Why the span question `id` has no answer, as {@link unanswered} says it; undefined when it answered, spans or none. */
+export function spanUnanswered(answers, spans, id) {
+  const answer = answers?.[id]
+  if (answer?.error === undefined && (answer !== undefined || Array.isArray(spans?.[id]))) return undefined
+  return unanswered(answer)
 }
 
 /** Compact, readable copy of one answer for traces and model-facing text. */

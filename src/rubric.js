@@ -51,6 +51,8 @@ const SPAN_EXAMPLE = '{"type": "span", "criteria": {"ERROR": "an error code or m
 
 const pick = (question, fields) => Object.fromEntries(fields.filter(key => question[key] !== undefined).map(key => [key, question[key]]))
 const isObject = value => Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+/** A field of an object under a name System Two chose: `__proto__` too is a field of its own, not the prototype. */
+export const put = (object, key, value) => Object.defineProperty(object, key, { value, enumerable: true, writable: true, configurable: true })
 const text = value => (typeof value === 'string' && value.trim() ? value.trim() : undefined)
 const quoted = list => list.map(name => `"${name}"`).join(', ')
 
@@ -79,7 +81,6 @@ export function parseJson(source) {
     at = end + 1
     return value
   }
-  const put = (object, key, value) => Object.defineProperty(object, key, { value, enumerable: true, writable: true, configurable: true })
   // whether two objects say nothing against each other: every key they share holds the same value
   const agree = (earlier, later) => Object.entries(later).every(([key, value]) => !Object.hasOwn(earlier, key)
     || (isObject(earlier[key]) && isObject(value) ? agree(earlier[key], value) : JSON.stringify(earlier[key]) === JSON.stringify(value)))
@@ -202,11 +203,16 @@ export function mendJson(source) {
 /**
  * A JSON argument that ran into the next arguments: a model's tool-call markup left inside it, as
  * `{...}, images</arg_key><arg_value>["a.png", "b.png"]`. Returns the argument's own text and the arguments written
- * after it (each value as JSON where it parses), or undefined for text without that markup.
+ * after it (each value as JSON where it parses), or undefined for text without that markup, and for valid JSON, whose
+ * strings may quote the markup.
  * @returns {{head: string, leaked: Record<string, unknown>} | undefined}
  */
 export function splitArguments(text) {
   if (typeof text !== 'string' || !text.includes('</arg_key>')) return undefined
+  try {
+    JSON.parse(text)
+    return undefined
+  } catch {}
   const start = text.search(/,?\s*(?:<arg_key>)?\s*[A-Za-z_][A-Za-z0-9_]*\s*<\/arg_key>/)
   if (start < 0) return undefined
   const leaked = {}
@@ -222,11 +228,14 @@ export function splitArguments(text) {
   return { head: text.slice(0, start).trim(), leaked }
 }
 
-/** The type a question's criteria imply: a list of levels is a score, named options a choice, anything else yes/no. */
+/**
+ * The type a question's criteria imply: a list of levels is a score, named options a choice, but for no and yes, or
+ * false and true, which are a yes/no question's; anything else yes/no.
+ */
 function impliedType(criteria) {
   if (Array.isArray(criteria)) return 'score'
   if (!isObject(criteria)) return 'noul'
-  return Object.keys(criteria).map(name => name.toLowerCase()).sort().join() === 'no,yes' ? 'noul' : 'choice'
+  return ['no,yes', 'false,true'].includes(Object.keys(criteria).map(name => name.toLowerCase()).sort().join()) ? 'noul' : 'choice'
 }
 
 /** A span question's labels: the names of its criteria. */
@@ -285,19 +294,24 @@ function levels(value) {
   return value
 }
 
-/** A threshold as the documented number between 0 and 1: from a numeric string, a percentage, or {"min": 0.5}. */
+// a threshold written as a number, as text ("0.4") or as a percentage ("40%")
+const NUMBER = /^\s*\d+(?:\.\d+)?\s*%?\s*$/
+
+/**
+ * A threshold as the documented number from 0 to 1, both included, as System One takes it: from a numeric string, a
+ * percentage, or {"min": 0.5}.
+ */
 function threshold(id, value, notes) {
   if (value === undefined || value === null || value === '') return undefined
   let number = value
   if (isObject(value)) number = [value.min, value.value, value.probability, value.p, value.threshold].find(entry => entry !== undefined)
-  if (typeof number === 'string' && /^\s*\d+(?:\.\d+)?\s*%?\s*$/.test(number)) number = Number.parseFloat(number) / (number.includes('%') ? 100 : 1)
+  if (typeof number === 'string' && NUMBER.test(number)) number = Number.parseFloat(number) / (number.includes('%') ? 100 : 1)
   // a whole number of percent, as 60
   if (typeof number === 'number' && Number.isInteger(number) && number > 1 && number <= 100) {
     notes.push(`${id}: threshold ${number} read as ${number / 100}`)
     number /= 100
   }
-  if (number === 0) return undefined
-  if (!(typeof number === 'number' && number > 0 && number < 1)) throw new Error(`question "${id}": threshold must be a number between 0 and 1, as "threshold": 0.5`)
+  if (!(typeof number === 'number' && number >= 0 && number <= 1)) throw new Error(`question "${id}": threshold must be a number between 0 and 1, as "threshold": 0.5`)
   if (number !== value) notes.push(`${id}: threshold read as ${number}`)
   return number
 }
@@ -489,7 +503,7 @@ export function readQuestions(value, { called = 'questions' } = {}) {
       const { id, name, key, ...question } = entry
       let own = text(id) ?? text(name) ?? text(key) ?? (aQuestion(question) ? idOf(question) : `q${index + 1}`)
       for (let n = 2; Object.hasOwn(listed, own); n++) own = `${text(id) ?? text(name) ?? text(key) ?? idOf(question)}_${n}`
-      listed[own] = question
+      put(listed, own, question)
     })
     notes.push(`${called} were a list: read as ${quoted(Object.keys(listed))}`)
     questions = listed
@@ -504,10 +518,11 @@ export function readQuestions(value, { called = 'questions' } = {}) {
     questions = { [id]: questions }
   }
   // a type, threshold, "over" or instructions written beside the questions is theirs, as
-  // {"type": "span", "threshold": 0.5, "ERROR": {...}}
+  // {"type": "span", "threshold": 0.5, "ERROR": {...}}, when it can be: a value that cannot is a question of that id,
+  // as {"threshold": "Is it urgent?"} is
   const shared = {}
   for (const key of ['type', 'threshold', 'over', 'instructions']) {
-    if (questions[key] !== undefined && !isObject(questions[key]) && !Array.isArray(questions[key])) {
+    if (questions[key] !== undefined && !isObject(questions[key]) && !Array.isArray(questions[key]) && besideFits(key, questions[key], questions)) {
       const { [key]: written, ...rest } = questions
       shared[key] = written
       questions = rest
@@ -564,9 +579,24 @@ export function readQuestions(value, { called = 'questions' } = {}) {
       }
       if (typeof shared.over === 'string' && question.over === undefined && !question.preset) question.over = shared.over
     }
-    out[id] = question
+    put(out, id, question)
   }
+  // what was written beside the questions and no question took is said, not dropped unseen
+  const spans = Object.values(out).filter(question => kindOf(question) === 'span' && !question.signal)
+  if (shared.threshold !== undefined && !spans.length) notes.push(`the threshold beside the questions, ${shared.threshold}, applies to span questions, and none was asked`)
+  if (shared.over !== undefined && !spans.some(question => question.over === shared.over)) notes.push(`"over" beside the questions, "${shared.over}", applies to custom span questions, and none was asked`)
   return { questions: out, notes }
+}
+
+/**
+ * Whether a value written beside the questions under a question field's name can be that field for them: a type's
+ * name, a threshold's number, a field's name for "over", or instructions for a question written without any.
+ */
+function besideFits(key, value, questions) {
+  if (key === 'type') return typeof value === 'string' && [TYPE_NAMES, PRESET_NAMES, SIGNAL_NAMES].some(names => names[squash(value)] !== undefined)
+  if (key === 'threshold') return typeof value === 'number' || (typeof value === 'string' && NUMBER.test(value))
+  if (key === 'over') return typeof value === 'string' && /^[A-Za-z_][\w.-]*$/.test(value.trim())
+  return Object.entries(questions).some(([id, entry]) => id !== key && isObject(entry) && !text(entry.instructions) && !INSTRUCTION_FIELDS.some(field => text(entry[field])))
 }
 
 /** System Two's questions, checked and completed: every question gets its type, a noul's criteria join its instructions. */
@@ -599,9 +629,12 @@ function wireOf(question, over) {
   return question
 }
 
-/** Why a question cannot be asked of these items at all: a span question of images, a box question of text. */
-export function unanswerable(question, { images = false } = {}) {
-  if (images && kindOf(question) !== 'decision') return 'span questions, presets and signals read text, not images'
+/**
+ * Why a question cannot be asked of these items at all: a span question of images only, a box question of text only
+ * (`images` and `texts`: whether the items include images, and texts).
+ */
+export function unanswerable(question, { images = false, texts = !images } = {}) {
+  if (!texts && kindOf(question) !== 'decision') return 'span questions, presets and signals read text, not images'
   if (!images && question.type === 'box') return 'a box question reads images'
   return undefined
 }
@@ -651,7 +684,7 @@ export function planQuestions(questions, { model, spanModel, parts, images = fal
       while (taken.has(wire) || Object.hasOwn(ROUTER_SIGNALS, wire)) wire = `${wire}_`
       taken.add(wire)
     }
-    asked[id] = { kind, wire, ...(over ? { over } : {}), ...(plain ? { plain } : {}), question: wireOf(question, over) }
+    put(asked, id, { kind, wire, ...(over ? { over } : {}), ...(plain ? { plain } : {}), question: wireOf(question, over) })
   }
   // one request group per model, and one more for the signals that read one part of each item as their text
   const groups = new Map()
@@ -660,8 +693,8 @@ export function planQuestions(questions, { model, spanModel, parts, images = fal
     const key = entry.plain ? `${by}\n${entry.plain}` : by
     if (!groups.has(key)) groups.set(key, { model: by, questions: {}, ids: {}, ...(entry.plain ? { reads: entry.plain } : {}) })
     const group = groups.get(key)
-    group.questions[entry.wire] = entry.question
-    group.ids[entry.wire] = id
+    put(group.questions, entry.wire, entry.question)
+    put(group.ids, entry.wire, id)
   }
   for (const entry of Object.values(asked)) delete entry.question
   return { groups: [...groups.values()], asked }

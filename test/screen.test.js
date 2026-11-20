@@ -23,11 +23,15 @@ function fakeVision() {
     const chunks = []
     request.on('data', chunk => chunks.push(chunk))
     request.on('end', () => {
+      // the published limits, as /api/info gives each model's
+      if (request.url === '/api/info') return response.end(JSON.stringify({ limits: { max_image_bytes: 8000000 }, models: [{ id: 'vllm-sr/vela3-turbo', limits: { max_image_bytes: 8000000 } }, { id: 'vllm-sr/d3-ultra', limits: { max_image_bytes: 16777216 } }] }))
       const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
       asked.push(body)
       const answers = {}
       for (const [id, question] of Object.entries(body.questions)) {
-        if (question.type === 'box') {
+        if (question.type === 'box' && /corner/.test(question.instructions)) answers[id] = { type: 'box', box: { left: 0.99, top: 0.99, right: 1, bottom: 1 }, confidence: 0.97 }
+        else if (question.type === 'box' && /faint/.test(question.instructions)) answers[id] = { type: 'box', box: { left: 0.25, top: 0.5, right: 0.75, bottom: 0.75 }, confidence: 0.3996 }
+        else if (question.type === 'box') {
           const save = /Save/.test(question.instructions)
           answers[id] = { type: 'box', box: save ? { left: 0.25, top: 0.5, right: 0.75, bottom: 0.75 } : { left: 0, top: 0, right: 0.1, bottom: 0.1 }, confidence: save ? 0.97 : 0.05 }
         } else if (question.type === 'choice') answers[id] = { type: 'choice', choice: 'billing', confidence: 0.9, probabilities: { billing: 0.9, settings: 0.1 } }
@@ -227,4 +231,35 @@ test('a screenshot the annotator cannot draw on is answered with a note, and the
   const moved = await run({ image: 'shots/02.png', before: 'shots/01.png', action: 'clicked Save', find: ['the Save button'], annotate: 'SHOTS/01.png' })
   assert.equal(moved.annotated, 'shots/02.annotated.png')
   assert.deepEqual(await readFile(join(workspace, 'shots/01.png')), before)
+})
+
+test('the copy is a PNG named as one, the pixel to click is always on the screenshot, and a target is found by its confidence as given', async t => {
+  const { workspace, run } = await setup(t)
+  const jpg = await run({ image: 'shots/02.png', find: ['the Save button'], annotate: 'shots/02.marked.jpg' })
+  assert.deepEqual([jpg.annotated, jpg.notes], ['shots/02.marked.png', ['annotate writes a PNG, so the copy is shots/02.marked.png']])
+  assert.deepEqual([...(await readFile(join(workspace, 'shots/02.marked.png'))).subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+  await assert.rejects(readFile(join(workspace, 'shots/02.marked.jpg')))
+  // a box that touches the screenshot's last row and column: its centre is past the edge, the click is on it
+  const corner = await run({ image: 'shots/02.png', find: ['the corner badge'] })
+  assert.deepEqual(corner.found['the corner badge'].click, { x: 199, y: 99 })
+  const faint = await run({ image: 'shots/02.png', find: ['the faint hint'] })
+  assert.deepEqual([faint.found['the faint hint'].confidence, faint.found['the faint hint'].found], [0.4, false])
+  // a target of any name keeps its place
+  const named = await run({ image: 'shots/02.png', find: '{"__proto__": "the Save button"}' })
+  assert.ok(Object.hasOwn(named.found, '__proto__'))
+  assert.equal(named.found.__proto__.found, true)
+})
+
+test('a large screenshot is checked against the chosen model\'s own image limit, as System One publishes it', async t => {
+  const { workspace, asked, run } = await setup(t)
+  const sized = bytes => {
+    const png = encodePng({ width: 2, height: 2, data: Buffer.alloc(16, 255) })
+    return Buffer.concat([png, Buffer.alloc(bytes - png.length)])
+  }
+  await writeFile(join(workspace, 'shots/big.png'), sized(9000000))
+  await writeFile(join(workspace, 'shots/bigger.png'), sized(12000000))
+  await assert.rejects(run({ image: 'shots/big.png', expect: 'a chart' }), /^Error: shots\/big\.png is 9\.0 MB, and vllm-sr\/vela3-turbo takes images of at most 8\.0 MB: pass a smaller screenshot/)
+  assert.equal(asked.length, 0, 'refused before it was sent')
+  const ultra = await run({ image: 'shots/bigger.png', expect: 'a chart', model: 'vllm-sr/d3-ultra' })
+  assert.deepEqual([ultra.model, ultra.expect.yes, asked.length], ['vllm-sr/d3-ultra', 0.91, 1])
 })

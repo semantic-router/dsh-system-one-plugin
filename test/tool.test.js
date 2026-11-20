@@ -28,7 +28,7 @@ const spansIn = (text, pattern, label, probability = 0.95) => [...text.matchAll(
   const start = Array.from(text.slice(0, match.index)).length
   return { label, start, end: start + Array.from(match[0]).length, text: match[0], probability }
 })
-const LABELS = { ERROR: 'HTTP \\d{3}|ERR_[A-Z_]+', COMPETITOR: 'Datadog|Snowflake' }
+const LABELS = { ERROR: 'HTTP \\d{3}|ERR_[A-Z_]+', COMPETITOR: 'Datadog|Snowflake', CONTACT_LINE: 'Contact \\S+@\\S+', EMAIL_ADDRESS: '[a-z]+@example\\.test' }
 const PERSONAL = [
   ['[a-z.]+@[a-z]+\\.example', 'EMAIL_ADDRESS'], ['\\+1 \\d{3} \\d{3} \\d{4}', 'PHONE_NUMBER'], ['Dana Ruiz', 'PERSON'], ['Priya Raman', 'PERSON'], ['Northwind', 'ORGANIZATION'],
   // as vllm-sr/vela3-turbo does: a call's id taken for a name, an address with the commas around it, and the
@@ -36,16 +36,18 @@ const PERSONAL = [
   ['C-\\d{4}', 'PERSON'], [', \\d+ Larch Road,', 'STREET_ADDRESS'], ['(?<=\\[)[A-Z_]{6,}(?=\\])', 'EMAIL_ADDRESS'],
   // a name, and the address it starts, marked apart
   ['Mara Lind', 'PERSON'], ['Lind@[a-z]+\\.example', 'EMAIL_ADDRESS'],
+  // the synthetic people of the audit's cases: an address in a field's name or an array, a phone number as a number
+  ['[a-z]+@example\\.test', 'EMAIL_ADDRESS'], ['\\b1555\\d{7}\\b', 'PHONE_NUMBER'],
 ]
 const picked = (question, choice) => {
   const options = Object.keys(question.criteria)
   return { type: 'choice', choice, confidence: 0.9, probabilities: Object.fromEntries(options.map(option => [option, option === choice ? 0.9 : 0.1 / (options.length - 1)])) }
 }
 
-// what the published models answer for these inputs, by question
+// what the published models answer for these inputs, by question; an id of any name, __proto__ too, is an answer's own
 function decide(questions, state, images) {
-  const answers = {}
-  const spans = {}
+  const answers = Object.create(null)
+  const spans = Object.create(null)
   const text = typeof state === 'string' ? state : Object.values(state).join('\n')
   for (const [id, question] of Object.entries(questions)) {
     // a question the service refuses for every item
@@ -77,12 +79,14 @@ function decide(questions, state, images) {
     else if (id === 'p_harm') answers[id] = picked(question, /explosive|poison/i.test(text) ? 'unsafe' : 'safe')
     else if (id === 'r_harm') answers[id] = picked(question, /tension wrench/.test(state.answer) ? 'unsafe response' : 'safe response')
     else if (id === 'r_refusal') answers[id] = picked(question, /can't help/.test(state.answer) ? 'refusal' : 'compliance')
+    // a question that asks for a name picks the first one it is given
+    else if (question.type === 'choice' && /^Which name/.test(question.instructions)) answers[id] = picked(question, Object.keys(question.criteria)[0])
     else if (question.type === 'choice') answers[id] = picked(question, /invoice|refund/i.test(text) ? 'billing' : 'support')
     else if (question.type === 'noul') answers[id] = { type: 'noul', noul: /!|fails|broken/i.test(text) ? 0.9 : 0.1 }
     else if (question.type === 'score') answers[id] = { type: 'score', score: /!/.test(text) ? 1.8 : 0.4, confidence: 0.9, probabilities: {} }
     else if (question.type === 'box') {
-      // a big image shows the target; a tiny one does not
-      answers[id] = { type: 'box', box: { left: 0.25, top: 0.25, right: 0.5, bottom: 0.5 }, confidence: images?.[0]?.length > 400 ? 0.92 : 0.1 }
+      // a big image shows the target; a tiny one does not; a faint one is just below the line
+      answers[id] = { type: 'box', box: { left: 0.25, top: 0.25, right: 0.5, bottom: 0.5 }, confidence: images?.[0]?.length > 400 ? (/faint/.test(question.instructions) ? 0.3996 : 0.92) : 0.1 }
     }
   }
   return { answers, spans }
@@ -112,6 +116,13 @@ function fakeDecisions() {
         const inputs = body.states === undefined ? [body] : Object.values(body.states)
         // each request as its first input reads, with all of its inputs
         asked.push({ model: body.model, ...inputs[0], inputs })
+        // as the Decision API refuses them: more than 64 questions in one request, and a box question of a text
+        const questionCount = inputs.reduce((sum, input) => sum + Object.keys(input.questions ?? body.questions ?? {}).length, 0)
+        const boxOfText = inputs.some(input => !input.images?.length && Object.values(input.questions ?? body.questions ?? {}).some(question => question.type === 'box'))
+        if (questionCount > 64 || boxOfText) {
+          response.writeHead(400, { 'content-type': 'application/json' })
+          return response.end(JSON.stringify({ error: questionCount > 64 ? { code: 'too_many_questions', message: `${questionCount} questions; at most 64` } : { code: 'invalid_request', message: 'no question is valid: a box question needs an image' } }))
+        }
         // an input that says so is refused, with its whole request: as invalid (400), or for its key (401)
         const refused = inputs.map(input => JSON.stringify(input.state).match(/REFUSE-(400|401)/)?.[1]).find(Boolean)
         if (refused) {
@@ -667,7 +678,7 @@ test('the rubrics System Two wrote in the demo recordings are read as they mean,
   // the model's tool-call markup inside the questions: what follows it is the next arguments
   assert.deepEqual(splitArguments('{"q": {"type": "noul", "instructions": "Broken?"}}, images</arg_key><arg_value>["a.png", "b.png"]'), { head: '{"q": {"type": "noul", "instructions": "Broken?"}}', leaked: { images: ['a.png', 'b.png'] } })
   assert.throws(() => readQuestions({ odd: { type: 'sentiment', instructions: 'Is it?' } }), /question "odd": type "sentiment" is none of choice, noul, score, box or span; or ask a preset, as \{"preset": "pii"\}, or a router signal, as \{"signal": "attack"\}/)
-  assert.throws(() => readQuestions({ x: { type: 'span', criteria: ['ERROR'], threshold: 1 } }), /question "x": threshold must be a number between 0 and 1, as "threshold": 0\.5/)
+  assert.throws(() => readQuestions({ x: { type: 'span', criteria: ['ERROR'], threshold: 1.5 } }), /question "x": threshold must be a number between 0 and 1, as "threshold": 0\.5/)
 })
 
 test('a path that is not there names what its folder holds, and a text field may be several or another case', async t => {
@@ -959,4 +970,205 @@ test('a question named after a column every row has, or two whose answers would 
   // a yes/no question named id writes id_yes, beside the item's own id
   await run({ questions: { id: { type: 'noul', instructions: 'Does it name an order id?' } }, items: ['order 88231-B'], output: 'ids.csv' })
   assert.deepEqual(parseCsv(await readFile(join(workspace, 'ids.csv'), 'utf8')), [{ id: '1', id_yes: '0.1' }])
+})
+
+test('every item has an id of its own: an inline item is numbered after a file\'s rows, an image another image\'s name has is its path', async t => {
+  const noise = { width: 4, height: 4, data: Buffer.alloc(64, 200) }
+  const { run } = await setup(t, { 'notes.txt': 'alpha\n', 'shots/a.png': encodePng(noise), 'other/a.png': encodePng(noise) })
+  const value = await run({ questions: { broken: { type: 'noul', instructions: 'Does it report something broken?' } }, file: 'notes.txt', items: ['beta'] })
+  assert.deepEqual((await readRows(value.output)).map(row => row.id), ['1', '2'])
+  assert.deepEqual(value.notes, ['1 item id(s) an earlier item had were given new ones: 1 → 2'])
+  const images = await run({ questions: { broken: { type: 'noul', instructions: 'Broken?' } }, images: ['shots/a.png', 'other/a.png'] })
+  assert.deepEqual(images.images.map(image => image.id), ['a.png', 'other/a.png'])
+})
+
+test('a question id that names a field of a question is a question when what it holds can be no such field', async t => {
+  const { asked, run } = await setup(t)
+  const value = await run({ questions: { threshold: 'Is it urgent?', other: 'Is it red?' }, items: ['the fire is red!'] })
+  assert.deepEqual(Object.keys(asked[0].questions).sort(), ['other', 'threshold'])
+  assert.deepEqual(Object.keys(value.summary).sort(), ['other', 'threshold'])
+  for (const key of ['type', 'over', 'instructions']) assert.deepEqual(Object.keys(readQuestions({ [key]: 'Is it urgent?', other: 'Is it red?' }).questions).sort(), [key, 'other'].sort(), key)
+  // a value that can be the field is theirs, as before, and one that no question takes is said
+  assert.equal(readQuestions({ threshold: 0.4, marks: { type: 'span', criteria: ['ERROR'] } }).questions.marks.threshold, 0.4)
+  assert.equal(readQuestions({ threshold: 0.4, angry: 'Is it angry?' }).notes.at(-1), 'the threshold beside the questions, 0.4, applies to span questions, and none was asked')
+})
+
+test('question ids, options and labels of any name keep their own place, __proto__ and constructor too', async t => {
+  const { asked, run } = await setup(t)
+  const questions = '{"__proto__": {"type": "choice", "instructions": "Which name fits?", "criteria": {"__proto__": "the first", "constructor": "the second"}}, "toString": {"type": "noul", "instructions": "Is it red?"}}'
+  const value = await run({ questions, items: ['red!', 'blue'] })
+  assert.deepEqual(Object.keys(asked[0].questions), ['__proto__', 'toString'])
+  assert.ok(Object.hasOwn(value.summary, '__proto__'))
+  assert.deepEqual(Object.entries(value.summary.__proto__.counts), [['__proto__', 2]])
+  assert.deepEqual([value.summary.toString.yes, value.summary.toString.no], [1, 1])
+  const plan = planQuestions(readQuestions(questions).questions, { model: 'm', spanModel: 's' })
+  assert.deepEqual([Object.keys(plan.asked), Object.keys(plan.groups[0].ids)], [['__proto__', 'toString'], ['__proto__', 'toString']])
+})
+
+test('criteria named false and true mean a yes/no question, and a span threshold may be 0 or 1, as System One takes them', () => {
+  assert.equal(parseQuestions({ binary: { instructions: 'Is the marker red?', criteria: { false: 'not red', true: 'red' } } }).binary.type, 'noul')
+  const thresholds = parseQuestions({ every: { type: 'span', criteria: ['ERROR'], threshold: 0 }, certain: { type: 'span', criteria: ['ERROR'], threshold: 1 }, personal: { preset: 'pii', threshold: '0' } })
+  assert.deepEqual([thresholds.every.threshold, thresholds.certain.threshold, thresholds.personal.threshold], [0, 1, 0])
+  assert.deepEqual(planQuestions(thresholds, { model: 'm', spanModel: 's' }).groups[0].questions.every, { type: 'span', criteria: ['ERROR'], threshold: 0 })
+  assert.throws(() => parseQuestions({ x: { type: 'span', criteria: ['ERROR'], threshold: 1.5 } }), /threshold must be a number between 0 and 1/)
+})
+
+test('valid JSON questions that quote the model\'s tool-call markup are read as they are', async t => {
+  const { asked, run } = await setup(t)
+  const questions = JSON.stringify({ markup: { type: 'noul', instructions: 'Does the line hold the text file</arg_key><arg_value>?' } })
+  const value = await run({ questions, items: ['file</arg_key><arg_value>'] })
+  assert.equal(asked[0].questions.markup.instructions, 'Does the line hold the text file</arg_key><arg_value>?')
+  assert.equal(value.notes, undefined)
+  assert.equal(splitArguments(questions), undefined)
+})
+
+test('a number or a literal in a JSON file is read as its text, and an empty text is no image', async t => {
+  const { asked, run } = await setup(t, { 'numbers.json': '[42, 43, true]', 'blank.jsonl': '""\n' })
+  await run({ questions: { big: { type: 'noul', instructions: 'Is the number above 40?' } }, file: 'numbers.json' })
+  assert.deepEqual(asked[0].inputs.map(input => input.state), ['42', '43', 'true'])
+  await run({ questions: { big: { type: 'noul', instructions: 'Is it empty?' } }, file: 'blank.jsonl' })
+  assert.equal(asked.at(-1).state, '(empty)')
+})
+
+test('System One reads each item as written: a cut is said, and a line keeps its indentation', async t => {
+  const long = { id: 'L-1', body: `${'x'.repeat(4100)} TAIL_SENTINEL` }
+  const { asked, run } = await setup(t, {
+    'long.jsonl': `${JSON.stringify(long)}\n`,
+    'notes.txt': '    indented line\n\tand a tabbed one\n',
+    'replies.jsonl': `${JSON.stringify({ id: 'R-1', user: 'Hi', answer: 'y'.repeat(4200) })}\n`,
+  })
+  const cut = await run({ questions: { broken: { type: 'noul', instructions: 'Broken?' } }, file: 'long.jsonl' })
+  assert.deepEqual(cut.notes, ['1 item(s) are longer than 4000 characters: System One read the first 4000 of each'])
+  await run({ questions: { broken: { type: 'noul', instructions: 'Broken?' } }, file: 'notes.txt' })
+  assert.deepEqual(asked.at(-1).inputs.map(input => input.state), ['    indented line', '\tand a tabbed one'])
+  // a field read on its own is cut at the same length, and said; the record it is in was longer too
+  const fields = await run({ questions: { harm: { signal: 'r_harm' } }, file: 'replies.jsonl', state_fields: { user: 'user', answer: 'answer' } })
+  assert.deepEqual(fields.notes, ['1 item(s) are longer than 4000 characters: System One read the first 4000 of each', '1 field value(s) are longer than 4000 characters: System One read the first 4000 of each'])
+})
+
+test('a source\'s line numbers count the blank lines it starts with', async t => {
+  const { run } = await setup(t, { 'CHANGELOG.md': '\n\n- exports use Parquet\n', 'draft.md': 'Exports use Parquet.\n' })
+  const value = await run({ questions: { backed: { preset: 'evidence' } }, file: 'draft.md', sources: ['CHANGELOG.md'] })
+  const [row] = await readRows(value.output)
+  assert.deepEqual(row.answers.backed.spans.map(span => [span.source, span.line]), [['CHANGELOG.md', 3]])
+  assert.equal(value.examples.backed[0].source, 'CHANGELOG.md:3')
+})
+
+test('a CSV keeps every row and cell: a record of empty cells, a header written twice, the cells past the header, and says so', async t => {
+  const notes = []
+  assert.deepEqual(parseCsv('id,text,text\n1,a,b\n,,\n\n', notes), [{ id: '1', text: 'a', text_2: 'b' }, { id: '', text: '', text_2: '' }])
+  assert.deepEqual(notes, ['the CSV header names "text" twice: its column 3 is read as "text_2"'])
+  const { workspace, run } = await setup(t, { 'tickets.csv': 'id,text\n1,hello,secret\n2,world,keep\n' })
+  const value = await run({ questions: { errors: { type: 'span', criteria: ['ERROR'] } }, file: 'tickets.csv', redact: true })
+  assert.deepEqual(value.notes, ['2 CSV row(s) have more cells than the header names: the cells past it are read as "column_3"'])
+  assert.equal(await readFile(join(workspace, 'tickets.redacted.csv'), 'utf8'), 'id,text,column_3\n1,hello,secret\n2,world,keep\n')
+})
+
+test('a redacted copy keeps each record\'s shape, and a name that holds personal data takes its pseudonym', async t => {
+  const { workspace, run } = await setup(t, {
+    'contacts.jsonl': `${JSON.stringify({ id: 'c1', contact: { phone: 15550102040, kind: 'mobile' } })}\n`,
+    'pairs.json': JSON.stringify([['contact', 'alice@example.test']]),
+    'keyed.json': JSON.stringify([{ 'alice@example.test': 'hello', 'bob@example.test': 'bye' }]),
+    'hosts.json': JSON.stringify({ '2001:db8::1': { note: 'a lab host' }, '10.0.0.999': { note: 'no address' } }),
+  })
+  const pii = { personal: { preset: 'pii' } }
+  await run({ questions: pii, file: 'contacts.jsonl', redact: true })
+  assert.deepEqual(JSON.parse(await readFile(join(workspace, 'contacts.redacted.jsonl'), 'utf8')), { id: 'c1', contact: { phone: '[PHONE_NUMBER]', kind: 'mobile' } })
+  await run({ questions: pii, file: 'pairs.json', redact: true })
+  assert.deepEqual(JSON.parse(await readFile(join(workspace, 'pairs.redacted.json'), 'utf8')), [['contact', '[EMAIL_ADDRESS]']])
+  const keyed = await run({ questions: pii, file: 'keyed.json', redact: true })
+  const [copy] = JSON.parse(await readFile(join(workspace, 'keyed.redacted.json'), 'utf8'))
+  assert.deepEqual(Object.values(copy), ['hello', 'bye'])
+  assert.ok(Object.keys(copy).every(key => /^EMAIL_ADDRESS-[0-9a-f]{10}$/.test(key)), Object.keys(copy).join())
+  assert.doesNotMatch(JSON.stringify(keyed), /example\.test/)
+  await run({ questions: pii, file: 'hosts.json', redact: true })
+  const hosts = JSON.parse(await readFile(join(workspace, 'hosts.redacted.json'), 'utf8'))
+  assert.deepEqual(Object.keys(hosts).map(key => key.replace(/-[0-9a-f]{10}$/, '-…')), ['IP_ADDRESS-…', '10.0.0.999'])
+})
+
+test('what one question finds to be personal is never shown by another, inside its marks included', async t => {
+  const { run, rendered } = await setup(t)
+  const value = await run({ questions: { personal: { preset: 'pii' }, contact: { type: 'span', criteria: { CONTACT_LINE: 'an instruction to contact someone' } } }, items: ['Contact ada@example.test today.'] })
+  assert.match(plainOf(value.examples.contact[0].parts), /\[CONTACT_LINE\]Contact \[EMAIL_ADDRESS\] today\./)
+  assert.doesNotMatch(JSON.stringify(value), /ada@example\.test/)
+  assert.doesNotMatch(rendered(value), /ada@example\.test/)
+  const [row] = await readRows(value.output)
+  assert.deepEqual(row.answers.contact.spans.map(span => span.text), ['Contact [EMAIL_ADDRESS]'])
+})
+
+test('with redact, what the copy replaces stays out of what System Two reads, and an id it marks is named by a pseudonym', async t => {
+  const records = [{ id: 'ada@example.test', body: 'Write to bob@example.test about the invoice.' }, { id: 'T-2', body: 'nothing here' }]
+  const { workspace, run, rendered } = await setup(t, { 'mail.jsonl': records.map(record => `${JSON.stringify(record)}\n`).join('') })
+  const value = await run({ questions: { emails: { type: 'span', criteria: { EMAIL_ADDRESS: 'an email address' } } }, file: 'mail.jsonl', redact: true })
+  assert.doesNotMatch(JSON.stringify(value), /example\.test/)
+  assert.doesNotMatch(rendered(value), /example\.test/)
+  assert.equal(value.examples.emails[0].kind, 'masked')
+  const copy = (await readFile(join(workspace, 'mail.redacted.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+  assert.match(copy[0].id, /^EMAIL_ADDRESS-[0-9a-f]{10}$/)
+  assert.equal(copy[0].body, 'Write to [EMAIL_ADDRESS] about the invoice.')
+  // the results file keeps the id beside its pseudonym, and no span's text
+  const [row] = await readRows(value.output)
+  assert.deepEqual([row.id, row.pseudonym, row.answers.emails.spans.map(span => span.text)], ['ada@example.test', copy[0].id, [undefined]])
+})
+
+test('a CSV cell that would run as a spreadsheet formula starts with a quote, in the results and a redacted copy; a plain number stays', async t => {
+  const { workspace, run } = await setup(t, {
+    'ids.jsonl': `${JSON.stringify({ id: '=1+1', body: 'Synthetic note.' })}\n${JSON.stringify({ id: '-5', body: 'Another note.' })}\n`,
+    'cells.csv': 'id,text\n@SUM(A1),+cmd|calc\n-7,"=HYPERLINK(""x"")"\n',
+  })
+  await run({ questions: { broken: { type: 'noul', instructions: 'Broken?' } }, file: 'ids.jsonl', output: 'results.csv' })
+  const lines = (await readFile(join(workspace, 'results.csv'), 'utf8')).trim().split('\n')
+  assert.deepEqual(lines.map(line => line.split(',')[0]), ['id', '\'=1+1', '-5'])
+  await run({ questions: { errors: { type: 'span', criteria: ['ERROR'] } }, file: 'cells.csv', redact: true })
+  assert.equal(await readFile(join(workspace, 'cells.redacted.csv'), 'utf8'), 'id,text\n\'@SUM(A1),\'+cmd|calc\n-7,"\'=HYPERLINK(""x"")"\n')
+})
+
+test('a score\'s levels that share the words before their colon each keep their count', async t => {
+  const { run } = await setup(t)
+  const value = await run({ questions: { urgency: { type: 'score', instructions: 'How urgent?', criteria: ['Low: can wait', 'Low: this week', 'High: today'] } }, items: ['a quiet ticket'] })
+  assert.deepEqual(value.summary.urgency.levels, { 'Low: can wait': 1, 'Low: this week': 0, 'High: today': 0 })
+})
+
+test('a request asks at most 64 questions: nine items of eight questions go in two requests', async t => {
+  const { asked, run } = await setup(t)
+  const questions = Object.fromEntries(Array.from({ length: 8 }, (_, n) => [`q${n + 1}`, { type: 'noul', instructions: `Question ${n + 1}?` }]))
+  const value = await run({ questions, items: Array.from({ length: 9 }, (_, n) => `item ${n + 1}`) })
+  assert.deepEqual(asked.map(body => body.inputs.length).sort((a, b) => b - a), [8, 1])
+  assert.deepEqual([value.partial, value.summary.q1.failed], [undefined, 0])
+})
+
+test('a call of texts and images asks each item what it can answer: a box question of the images, a span question of the texts', async t => {
+  const noise = { width: 40, height: 30, data: randomBytes(40 * 30 * 4) }
+  const { asked, run } = await setup(t, { 'notes.txt': 'the export fails with HTTP 504\n', 'shots/a.png': encodePng(noise) })
+  const value = await run({
+    questions: { where: { type: 'box', instructions: 'The error message' }, errors: { type: 'span', criteria: ['ERROR'] }, broken: { type: 'noul', instructions: 'Broken?' } },
+    file: 'notes.txt',
+    images: ['shots/a.png'],
+  })
+  assert.equal(value.partial, undefined)
+  assert.deepEqual([value.summary.where.found, value.summary.where.of, value.summary.where.failed], [1, 1, 0])
+  assert.deepEqual([value.summary.errors.items, value.summary.errors.of, value.summary.errors.failed], [1, 1, 0])
+  assert.deepEqual([value.summary.broken.yes + value.summary.broken.no, value.summary.broken.failed], [2, 0])
+  const rows = await readRows(value.output)
+  assert.deepEqual(rows.map(row => Object.keys(row.answers).sort()), [['broken', 'where'], ['broken', 'errors']])
+  assert.ok(asked.every(body => body.inputs.every(input => input.images?.length || !Object.values(input.questions).some(question => question.type === 'box'))))
+})
+
+test('a box is found by its confidence as the model gives it: 0.3996 is below 0.4, though it reads 0.4 rounded', async t => {
+  const noise = { width: 40, height: 30, data: randomBytes(40 * 30 * 4) }
+  const { run } = await setup(t, { 'shots/a.png': encodePng(noise) })
+  const value = await run({ questions: { spot: { type: 'box', instructions: 'the faint mark' } }, images: ['shots/a.png'], annotate: 'marked' })
+  assert.deepEqual([value.summary.spot.found, value.images[0].boxes, value.annotated.files], [0, [], []])
+  const [row] = await readRows(value.output)
+  assert.deepEqual([row.answers.spot.confidence, row.answers.spot.found], [0.4, false])
+})
+
+test('Windows paths: an image\'s id is its file\'s name, and the results of an extensionless file in a dot-named folder go beside it', async t => {
+  const noise = { width: 4, height: 4, data: Buffer.alloc(64, 200) }
+  // a file whose name holds a backslash stands here for a Windows path
+  const { workspace, run } = await setup(t, { 'shots\\a.png': encodePng(noise), 'project.v1\\tickets': 'alpha\n' })
+  const image = await run({ questions: { broken: { type: 'noul', instructions: 'Broken?' } }, images: ['shots\\a.png'] })
+  assert.equal(image.images[0].id, 'a.png')
+  const tickets = await run({ questions: { broken: { type: 'noul', instructions: 'Broken?' } }, file: 'project.v1\\tickets' })
+  assert.equal(tickets.output, join(workspace, 'project.v1\\tickets.s1.jsonl'))
 })

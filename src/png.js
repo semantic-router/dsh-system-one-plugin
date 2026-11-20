@@ -114,6 +114,10 @@ export function decodePng(buffer) {
       pixels[row + x] = value & 0xff
     }
   }
+  // an RGB or grey image's tRNS chunk names the one colour that is transparent, each sample in two bytes
+  const key = alpha && (color === 2 ? alpha.length >= 6 : color === 0 ? alpha.length >= 2 : false)
+    ? Array.from({ length: color === 2 ? 3 : 1 }, (_, sample) => alpha.readUInt16BE(sample * 2))
+    : undefined
   const rgba = Buffer.alloc(width * height * 4)
   for (let i = 0; i < width * height; i++) {
     const o = i * 4
@@ -122,13 +126,13 @@ export function decodePng(buffer) {
       rgba[o] = pixels[i * 3]
       rgba[o + 1] = pixels[i * 3 + 1]
       rgba[o + 2] = pixels[i * 3 + 2]
-      rgba[o + 3] = 255
+      rgba[o + 3] = key && key.every((value, sample) => value === pixels[i * 3 + sample]) ? 0 : 255
     } else if (color === 0 || color === 4) {
       const grey = pixels[i * channels]
       rgba[o] = grey
       rgba[o + 1] = grey
       rgba[o + 2] = grey
-      rgba[o + 3] = color === 4 ? pixels[i * 2 + 1] : 255
+      rgba[o + 3] = color === 4 ? pixels[i * 2 + 1] : key && key[0] === grey ? 0 : 255
     } else {
       const index = pixels[i]
       rgba[o] = palette[index * 3] ?? 0

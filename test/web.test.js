@@ -909,3 +909,45 @@ test('the model line\'s selectors and styles are the ones docs/reference.md docu
   for (const value of drawn) assert.ok(selectors.includes(`data-system-two-part="${value}"`) || selectors.includes(`\`${value}\``), `docs/reference.md documents ${value}`)
   for (const name of ['data-system-two', 'data-system-two-model', 'data-system-two-decision', 'data-system-two-reasoning', 'data-system-two-changed']) assert.ok(selectors.includes(`\`${name}\``), `docs/reference.md documents ${name}`)
 })
+
+test('more thumbnails than the Chat cache keeps, all read at once, leave no URL behind: each one it drops is revoked', async () => {
+  const made = []
+  const revoked = []
+  const globals = {
+    Blob: class {
+      constructor(parts, options) {
+        this.parts = parts
+        this.type = options?.type
+      }
+    },
+    URL: { createObjectURL: () => `blob:${made.push(1)}`, revokeObjectURL: url => revoked.push(url) },
+  }
+  const eager = { ...fakeReact, useState: init => [typeof init === 'function' ? init() : init, () => {}], useEffect: effect => { effect() } }
+  const { exports } = load({ require: specifier => (specifier === 'react' ? eager : assert.fail(specifier)), globals })
+  // every read waits until the test lets them all settle
+  const pending = []
+  const readBytes = () => new Promise(resolve => pending.push(() => resolve({ ok: true, value: { offset: 0, data: new Uint8Array([137, 80, 78, 71]), eof: true } })))
+  exports.apply({ inject: (deps, callback) => callback(deps.includes('remote.workspaceFiles') ? { remote: { workspaceFiles: { readBytes } } } : {}) })
+  // nine batch rows of twelve images: 108 thumbnails before any read settles
+  for (let row = 0; row < 9; row++) {
+    const images = Array.from({ length: 12 }, (_, n) => ({ id: `s${row}-${n}.png`, path: `/work/shots/s${row}-${n}.png`, boxes: [], answers: {} }))
+    const meta = { systemOne: 1, ui: 'card', model: 'vllm-sr/d3-ultra', items: 12, questions: 1, requests: 12, seconds: 1, output: '/work/r.jsonl', summary: { broken: { type: 'noul', yes: 0, no: 12, top: [], failed: 0 } }, images }
+    render(exports.SystemOneToolRow({ callId: `c${row}`, toolName: 'system_one', cwd: '/work', sessionId: 'session-1', phase: 'result', block: { time: Date.now(), isError: false, content: [], meta, call: { name: 'system_one', argsRaw: '{}' } } }))
+  }
+  assert.equal(pending.length, 108)
+  for (const settle of pending) settle()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(made.length, 108)
+  // 96 stay in the cache, and the 12 past them are revoked, none twice
+  assert.deepEqual([revoked.length, new Set(revoked).size], [12, 12])
+})
+
+test('a shield card says how many passages System One could not screen, and a privacy card when part of a result went unmasked', () => {
+  const { exports } = load()
+  const [shield] = assemble(exports.definition, [record({ reflex: 'shield', step: 3, callId: 'c1', tool: 'read', call: 'README.md', passages: 3, flagged: 1, removedLines: 2, maxP: 0.98, verdict: 'removed', unscreened: 1 })])
+  const shown = render(exports.SystemOneNode({ node: shield }))
+  assert.deepEqual(findAll(shown, props => props['data-system-one-fact'] === 'unscreened').map(fact => textOf(fact)), ['Not screened1 passage'])
+  assert.match(textOf(shown), /System One could not screen 1 passage of it, which System Two read as they were\./)
+  const [privacy] = assemble(exports.definition, [record({ reflex: 'privacy', step: 3, callId: 'c2', tool: 'read', call: 'notes.txt', verdict: 'error', error: '1 of 2 part(s) not looked at: invalid_question', masked: 1, labels: { EMAIL_ADDRESS: 1 } })])
+  assert.match(textOf(render(exports.SystemOneNode({ node: privacy }))), /so part of the result went to System Two unmasked/)
+})

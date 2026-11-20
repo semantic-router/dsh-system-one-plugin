@@ -7,8 +7,8 @@
  * DeepSeek Harness 0.2.2 sets request headers through its `llm-pi-ai/request-headers` waterfall, 0.2.1 has no such
  * seam, and neither hands a plugin the answer's headers. So each router request runs in an async context that the
  * `llm/stream` waterfall opens, and a wrapper of the global `fetch` acts only inside one, on its chat completions
- * call: it adds the headers the request lacks and reads the answer's routing headers. Every other fetch passes
- * through untouched.
+ * call to the router's host: it adds the headers the request lacks and reads the answer's routing headers. Every
+ * other fetch, a chat request to another host included, passes through untouched.
  */
 import { AsyncLocalStorage } from 'node:async_hooks'
 
@@ -93,18 +93,13 @@ export function routeOf(headers) {
  */
 export const inCall = (call, fn) => calls.run(call, fn)
 
-/**
- * The chunk stream with its every step inside the call's async context, so that the request its adapter makes is
- * known to be this call's.
- * @param {object} call
- * @param {AsyncIterable<unknown>} stream
- */
-export async function* withinCall(call, stream) {
-  const iterator = calls.run(call, () => stream[Symbol.asyncIterator]())
+// a stream with its every step run by `run`, inside a call's async context or outside every call's
+async function* stepped(run, stream) {
+  const iterator = run(() => stream[Symbol.asyncIterator]())
   let done = false
   try {
     while (true) {
-      const result = await calls.run(call, () => iterator.next())
+      const result = await run(() => iterator.next())
       if (result.done) {
         done = true
         return result.value
@@ -112,24 +107,61 @@ export async function* withinCall(call, stream) {
       yield result.value
     }
   } finally {
-    if (!done && typeof iterator.return === 'function') await calls.run(call, () => iterator.return())
+    if (!done && typeof iterator.return === 'function') await run(() => iterator.return())
   }
 }
+
+/**
+ * The chunk stream with its every step inside the call's async context, so that the request its adapter makes is
+ * known to be this call's.
+ * @param {object} call
+ * @param {AsyncIterable<unknown>} stream
+ */
+export const withinCall = (call, stream) => stepped(fn => calls.run(call, fn), stream)
+
+/**
+ * Runs the rest of a waterfall, and the stream it returns, outside every router call: a model call made inside one,
+ * as another provider's, is a call of its own, whose request gets none of the router call's headers.
+ * @param {() => AsyncIterable<unknown>} fn
+ */
+export const outsideCall = fn => stepped(step => calls.exit(step), calls.exit(fn))
 
 /** The call whose async context this is, if any. */
 export const currentCall = () => calls.getStore()
 
+/**
+ * The router's host for a call, from the base URL DeepSeek Harness 0.2.2 names for its request; it wins over the one
+ * the call's first chat request went to.
+ */
+export function pinOrigin(call, baseURL) {
+  if (!call) return
+  try {
+    call.origin = new URL(baseURL).origin
+  } catch {
+    // a base URL that is no URL names no host
+  }
+}
+
 const isRequest = value => typeof Request === 'function' && value instanceof Request
 
-function isChat(input, init) {
+/**
+ * A call's chat request to the router: a POST to a path ending in /chat/completions, on the router's host, the one
+ * the call was told (pinOrigin) or else the one its first such request goes to (DeepSeek Harness 0.2.1 names none).
+ * The same path on any other host, as a request nested inside the call, is another service's.
+ */
+function routerChat(call, input, init) {
   const method = String(init?.method ?? (isRequest(input) ? input.method : 'GET')).toUpperCase()
   if (method !== 'POST') return false
-  const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input?.url
+  const href = typeof input === 'string' ? input : input instanceof URL ? input.href : input?.url
+  let url
   try {
-    return /\/chat\/completions\/?$/.test(new URL(url).pathname)
+    url = new URL(href)
   } catch {
     return false
   }
+  if (!/\/chat\/completions\/?$/.test(url.pathname)) return false
+  call.origin ??= url.origin
+  return url.origin === call.origin
 }
 
 async function routed(original, call, input, init) {
@@ -157,7 +189,7 @@ function wrapFetch() {
   if (typeof original !== 'function') return undefined
   const wrapped = function fetch(input, init) {
     const call = calls.getStore()
-    if (!call || !isChat(input, init)) return original(input, init)
+    if (!call || !routerChat(call, input, init)) return original(input, init)
     return routed(original, call, input, init)
   }
   globalThis.fetch = wrapped

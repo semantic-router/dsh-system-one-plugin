@@ -21,16 +21,16 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import z from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import * as dshSession from '@deepseek-ai/dsh-session'
-import { REQUEST_TOKENS, askAll, createDecisionClient, compactAnswer, requestSlices, stateCost, yes } from './client.js'
-import { GUARD_TOOLS, PRIVACY_TOOLS, SHIELD_TOOLS, onlyReads, sourceOf, toolMatcher } from './coverage.js'
-import { SERVICES, appendDotenv, describeKeys, ensureKeys, readDotenv } from './keys.js'
+import { REQUEST_TOKENS, askAll, createDecisionClient, compactAnswer, requestSlices, spanUnanswered, stateCost, unanswered, yes } from './client.js'
+import { GUARD_TOOLS, HARNESS_NOTED, PRIVACY_TOOLS, SHIELD_TOOLS, onlyReads, sourceOf, toolMatcher } from './coverage.js'
+import { KeyError, SERVICES, appendDotenv, describeKeys, ensureKeys, readDotenv } from './keys.js'
 import { pseudonymKeys } from './pseudonyms.js'
 import {
   DANGER_SPANS, DONE, EFFORT_LEVELS, EVIDENCE_SPANS, GUARD, HALU_SPANS, HARM_SIGNAL, PII_SPANS, REFUSAL_SIGNAL, REPLY_HARM_SIGNAL, RISK_LEVELS, SENSITIVE_LABELS, TRIAGE,
 } from './questions.js'
 import { writePolicy } from './permissions.js'
 import { UI_MODES, approvalOutcome, createRecorder, failureOf, relativeTo, subject } from './records.js'
-import { holdFetch, inCall, routerHeaders, withinCall } from './router.js'
+import { currentCall, holdFetch, inCall, outsideCall, pinOrigin, routerHeaders, withinCall } from './router.js'
 import { SCREEN_TOOL, screenTool } from './screen.js'
 import { cutBefore, screen, screenable } from './shield.js'
 import { everywhere, joined } from './redact.js'
@@ -173,6 +173,26 @@ const SCREEN_PROMPT = `
 function textOf(content) {
   return (content ?? []).filter(block => block?.type === 'text').map(block => block.text).join('\n').trim()
 }
+
+/** A result's blocks with its text as `text`, one block where its first text block was; every other block stays. */
+function withText(content, text) {
+  const out = []
+  let placed = false
+  for (const block of content ?? []) {
+    if (block?.type !== 'text') out.push(block)
+    else if (!placed) {
+      out.push({ type: 'text', text })
+      placed = true
+    }
+  }
+  if (!placed) out.unshift({ type: 'text', text })
+  return out
+}
+
+// the guard's verdicts, the strictest last
+const STRICTER = { allow: 0, ask: 1, deny: 2 }
+// the tools a done-check counts as changing files, whose results it expects to be checked
+const WRITES = ['write', 'edit', 'apply_patch', 'str_replace_editor']
 
 function ms(value) {
   return Math.round(value)
@@ -413,6 +433,12 @@ export function apply(ctx, config) {
       appendDotenv(envFile, ref, value)
       if (store) await store.set(ref, value)
     }
+    const tell = said => {
+      if (!said) return
+      if (!store) process.stderr.write(`${said.text}\n`)
+      keysNotice = notice(said.text, said.summary)
+      keysRecord = said.record
+    }
     keysReady = (async () => {
       // A System One key from before System Duo works for vllm-sr/auto too: reuse it rather than make another.
       if (!(await resolve(config.llmKeyEnv))) {
@@ -422,13 +448,13 @@ export function apply(ctx, config) {
       return ensureKeys({ resolve, store: keep, services, label: config.keyLabel, signal: keysAbort.signal })
     })().then(({ allocated, failed }) => {
       trace({ ev: 'keys', store: Boolean(store), allocated: allocated.map(s => s.site), failed: failed.map(f => ({ site: f.service.site, code: f.error.code, message: clip(String(f.error.message), 200) })) })
-      const said = describeKeys({ allocated, failed: keysAbort.signal.aborted ? [] : failed }, { file: where, store: Boolean(store) })
-      if (!said) return
-      if (!store) process.stderr.write(`${said.text}\n`)
-      keysNotice = notice(said.text, said.summary)
-      keysRecord = said.record
+      tell(describeKeys({ allocated, failed: keysAbort.signal.aborted ? [] : failed }, { file: where, store: Boolean(store) }))
     }, error => {
       trace({ ev: 'keys', error: clip(String(error?.message ?? error), 300) })
+      // a credential store that could not be read leaves the key neither found nor made: said as a refused key is
+      if (keysAbort.signal.aborted) return
+      const why = new KeyError(`DeepSeek Harness's credential store could not be read (${subject(error?.message ?? error, 100)}), so no key was looked for or made`, { code: 'credentials' })
+      tell(describeKeys({ allocated: [], failed: services.map(service => ({ service, error: why })) }, { file: where, store: Boolean(store) }))
     }).finally(() => {
       keysSettled = true
     })
@@ -563,11 +589,15 @@ export function apply(ctx, config) {
 
   if (config.routerSession || modelLine) {
     ctx.effect(() => holdFetch())
-    // DeepSeek Harness 0.2.2 and later set request headers here; with 0.2.1 the fetch wrapper adds them
+    // DeepSeek Harness 0.2.2 and later set request headers here, and name the router's base URL; with 0.2.1 the fetch
+    // wrapper adds them
     ctx.on('llm-pi-ai/request-headers', (request, headers, next) => {
       const prepared = next()
       const call = routerCall(request)
-      if (!call || typeof prepared?.has !== 'function') return prepared
+      if (!call) return prepared
+      // the router's own host: a request of this call to any other host gets none of the router's headers
+      if (typeof request.baseURL === 'string') pinOrigin(currentCall(), request.baseURL)
+      if (typeof prepared?.has !== 'function') return prepared
       for (const [name, value] of Object.entries(routerHeaders(call))) {
         if (!prepared.has(name)) prepared.set(name, value)
       }
@@ -575,7 +605,9 @@ export function apply(ctx, config) {
     })
     ctx.on('llm/stream', (options, next) => {
       const call = routerCall(options)
-      return call ? withinCall(call, inCall(call, next)) : next()
+      if (call) return withinCall(call, inCall(call, next))
+      // a model call made inside a router call (another provider's, a title) is not that call: it runs outside it
+      return currentCall() ? outsideCall(next) : next()
     })
   }
 
@@ -703,6 +735,11 @@ export function apply(ctx, config) {
       // the r_harm entry's answers join the first window's (their ids differ); a later window's risk and leak answers
       // take the first's place when they are worse
       const windowed = entries.map((entry, index) => ({ entry, answers: response.answers[index] ?? {}, spans: response.spans[index] ?? {} }))
+      // the guard's own questions that System One answered with an error in place, as a request that succeeds may, or
+      // not at all: they leave the call unreviewed, read before a later window's answer takes a place
+      const gaps = windowed.flatMap(({ entry, answers: given }) => (entry.window === undefined ? [] : Object.keys(entry.window === 0 ? GUARD : later))
+        .map(id => ({ id, why: unanswered(given[id]) }))
+        .filter(gap => gap.why))
       const answers = Object.assign({}, ...windowed.filter(({ entry }) => !entry.window).map(({ answers: given }) => given))
       for (const { entry, answers: given } of windowed) {
         if (!entry.window) continue
@@ -744,6 +781,18 @@ export function apply(ctx, config) {
       if (unreviewed) {
         verdict = config.guardAskMode === 'deny' ? 'deny' : 'ask'
         why = `System One reviewed only the first ${review.reviewed} of its ${review.total} characters`
+      }
+      // A question System One answered with an error is no answer, and never a safe one: the call gets the guard's error
+      // policy, guardOnError, as one System One could not be asked about does, unless what it did answer asks about the
+      // call or blocks it already.
+      if (gaps.length && STRICTER[config.guardOnError] >= STRICTER[verdict]) {
+        const error = `${[...new Set(gaps.map(gap => gap.id))].join(', ')}: ${gaps[0].why}`
+        trace({ ev: 's1', reflex: 'guard', session: state?.id, turn: state?.turn, tool: exec.name, call: briefCall(exec), model: response.model, ms: ms(response.ms), verdict: config.guardOnError, error, answers: answersOf(answers) })
+        decision.answer({ model: response.model, ms: ms(response.ms), requestId: response.requestId, answers: answersOf(answers), verdict: config.guardOnError, error: subject(error) })
+        if (config.guardOnError === 'ask') state?.asked.set(exec.callId, base)
+        if (config.guardOnError === 'deny') return { kind: 'deny', reason: `System One could not review this call (it did not answer ${error}); the call was not run.` }
+        if (config.guardOnError === 'ask') return { kind: 'ask', reason: `System One could not review this call (it did not answer ${error})`, displayReason: { en: `System One could not review this call (it did not answer ${error}): allow it?` } }
+        return next()
       }
       // A flagged call: which part of it does the damage, so the card and the question can point at it.
       let danger
@@ -826,9 +875,13 @@ export function apply(ctx, config) {
     ctx.on('tools/post-execute', async (exec, result, next) => {
       const screens = shielded(exec.name)
       const masks = masked(exec.name)
-      if ((!screens && !masks) || !exec.agent || result.isError) return next()
+      // An error result is read as any other: a page's error body or a command's stderr can give orders and carry
+      // personal data as well as its output can.
+      if ((!screens && !masks) || !exec.agent) return next()
       const full = textOf(result.content)
       if (!full) return next()
+      // the harness writes lines of its own (a sandbox note) only into a shell's output; anywhere else they are the text's
+      const noted = HARNESS_NOTED.has(exec.name)
       const state = sessionState(exec.agent)
       // The read tool wraps file text in its own envelope; only the file text is screened.
       const envelope = full.match(/^(<path>[^\n]*<\/path>\n<type>[^\n]*<\/type>\n<content>\n)([\s\S]*?)(\n<\/content>\s*)?$/)
@@ -846,14 +899,14 @@ export function apply(ctx, config) {
       let verdict
       let elapsed
       let shielding
-      if (screens && full.length >= config.shieldMinChars && screenable(screened)) {
+      if (screens && full.length >= config.shieldMinChars && screenable(screened, { harness: noted })) {
         shielding = deciding(exec.agent.session, { reflex: 'shield', ...target })
         const started = performance.now()
         try {
           verdict = await screen({
             client, model: config.model, prefix: about, text: screened, threshold: config.shieldThreshold, chunkChars: config.shieldChunkChars,
             signal: exec.signal, timeoutMs: config.hookTimeoutMs, retries: config.hookRetries,
-            spans: spans && config.shieldSpans ? { model: config.spanModel, about } : undefined,
+            spans: spans && config.shieldSpans ? { model: config.spanModel, about } : undefined, harness: noted,
           })
         } catch (error) {
           trace({ ev: 's1', reflex: 'shield', session: state?.id, tool: exec.name, call: briefCall(exec), error: String(error?.message ?? error) })
@@ -866,11 +919,13 @@ export function apply(ctx, config) {
       // what lies past the screened part is withheld once the shield has screened the rest; a shield that failed passes
       // the result on as it is, and says so
       const withheld = verdict && tail.length > 0 ? { withheld: tail.length, screenedChars: screened.length } : undefined
+      // passages System One answered with an error in place were not screened: never a clean result
+      const unscreened = verdict?.unscreened ? `${verdict.unscreened} of ${verdict.passages} passage(s) not screened: ${verdict.why}` : undefined
       if (verdict) {
         trace({
           ev: 's1', reflex: 'shield', session: state?.id, turn: state?.turn, tool: exec.name, call: briefCall(exec), model: verdict.model, ms: ms(elapsed),
-          passages: verdict.passages, verdict: verdict.removedLines || verdict.removedSpans ? 'removed' : withheld ? 'withheld' : 'clean', removedLines: verdict.removedLines,
-          removedSpans: verdict.removedSpans, spanModel: verdict.spanModel, ...withheld,
+          passages: verdict.passages, verdict: verdict.removedLines || verdict.removedSpans ? 'removed' : unscreened ? 'error' : withheld ? 'withheld' : 'clean', removedLines: verdict.removedLines,
+          removedSpans: verdict.removedSpans, spanModel: verdict.spanModel, ...withheld, ...(unscreened ? { unscreened: verdict.unscreened, error: unscreened } : {}),
           flagged: verdict.flagged.map(entry => ({ p: round3(entry.p), text: clip(entry.text, 400), lines: entry.lines.map(line => ({ p: round3(line.p), text: line.text })), spans: entry.spans })),
         })
       }
@@ -882,13 +937,17 @@ export function apply(ctx, config) {
         throw error
       }
       const removed = verdict && (verdict.removedLines > 0 || verdict.removedSpans > 0)
-      if (verdict) {
+      if (verdict && unscreened && !removed) {
+        // what the shield could not screen passes on as it is, as when System One cannot be asked, and its card says so
+        shielding.answer({ model: verdict.model, ms: ms(elapsed), passages: verdict.passages, unscreened: verdict.unscreened, error: subject(unscreened), ...withheld })
+      } else if (verdict) {
         // A later handler that blocks the result keeps the whole passage from the model, so the injection was found, not removed.
         const outcome = !removed ? (withheld ? 'withheld' : 'clean') : downstream.kind === 'block' ? 'flagged' : 'removed'
         const shown = verdict.flagged.flatMap(entry => entry.excerpts).slice(0, 2)
         shielding.answer({
           model: verdict.model, ms: ms(elapsed), passages: verdict.passages, flagged: verdict.flagged.length,
           removedLines: verdict.removedLines, maxP: round3(verdict.maxP), verdict: outcome, ...withheld,
+          ...(verdict.unscreened ? { unscreened: verdict.unscreened } : {}),
           ...(verdict.spanModel ? { spanModel: verdict.spanModel, spanMs: ms(verdict.spanMs) } : {}),
           ...(verdict.removedSpans ? { removedSpans: verdict.removedSpans, removedChars: verdict.removedChars, excerpts: shown } : {}),
         })
@@ -913,19 +972,26 @@ export function apply(ctx, config) {
         try {
           const parts = windows(body, 12000)
           const found = []
+          // the parts System One answered with an error in place: they were not looked at
+          const unlooked = []
           let model = config.spanModel
           for (const { start, count } of requestSlices(parts.map(part => part.text), 1)) {
             const batch = parts.slice(start, start + count)
             const answer = await client.ask({ model: config.spanModel, questions: PII_SPANS, inputs: batch.map(part => ({ state: part.text })), signal: exec.signal, timeoutMs: config.hookTimeoutMs, retries: config.hookRetries })
             model = answer.model
             batch.forEach((part, offset) => {
+              const why = spanUnanswered(answer.answers[offset], answer.spans[offset], 'pii')
+              if (why) {
+                unlooked.push(why)
+                return
+              }
               const marked = placeSpans(answer.spans[offset]?.pii, part.text, { min: config.privacyAt, overlaps: true })
                 .map(span => trimSpan(span, part.text))
                 .filter(span => span && personal(span, state?.user) && !notPersonal(span, part.text))
               for (const span of marked) found.push({ ...span, start: span.start + part.start, end: span.end + part.start })
             })
           }
-          privacy = { model, ms: performance.now() - started, spans: found }
+          privacy = { model, ms: performance.now() - started, spans: found, ...(unlooked.length ? { unlooked: `${unlooked.length} of ${parts.length} part(s) not looked at: ${unlooked[0]}` } : {}) }
         } catch (error) {
           trace({ ev: 's1', reflex: 'privacy', session: state?.id, tool: exec.name, call: briefCall(exec), error: String(error?.message ?? error) })
           if (!exec.signal?.aborted) masking.answer({ verdict: 'error', error: subject(error?.message ?? error) })
@@ -937,10 +1003,14 @@ export function apply(ctx, config) {
       const cuts = hidden.length ? joined(everywhere(body, hidden)) : []
       if (privacy) {
         const labels = labelCounts(hidden)
-        trace({ ev: 's1', reflex: 'privacy', session: state?.id, turn: state?.turn, tool: exec.name, call: briefCall(exec), model: privacy.model, ms: ms(privacy.ms), masked: hidden.length, labels })
-        masking.answer(hidden.length
-          ? { model: privacy.model, ms: ms(privacy.ms), verdict: 'masked', masked: hidden.length, labels, excerpts: excerpts(body, cuts, { hide: true, around: 40, max: 3 }) }
-          : { model: privacy.model, ms: ms(privacy.ms), verdict: 'clean', masked: 0 })
+        trace({ ev: 's1', reflex: 'privacy', session: state?.id, turn: state?.turn, tool: exec.name, call: briefCall(exec), model: privacy.model, ms: ms(privacy.ms), masked: hidden.length, labels, ...(privacy.unlooked ? { error: privacy.unlooked } : {}) })
+        // a part not looked at went to System Two as it is, as when System One cannot be asked: never a clean result,
+        // beside what was masked elsewhere
+        masking.answer(privacy.unlooked
+          ? { model: privacy.model, ms: ms(privacy.ms), verdict: 'error', error: subject(privacy.unlooked), ...(hidden.length ? { masked: hidden.length, labels } : {}) }
+          : hidden.length
+            ? { model: privacy.model, ms: ms(privacy.ms), verdict: 'masked', masked: hidden.length, labels, excerpts: excerpts(body, cuts, { hide: true, around: 40, max: 3 }) }
+            : { model: privacy.model, ms: ms(privacy.ms), verdict: 'clean', masked: 0 })
       }
       if (!removed && hidden.length === 0 && !withheld) return downstream
 
@@ -958,9 +1028,10 @@ export function apply(ctx, config) {
         const counts = Object.entries(labelCounts(hidden)).map(([label, n]) => `${label} ${n}`).join(', ')
         banners.push(`[System One privacy · ${privacy.model} · ${seconds(privacy.ms)}: masked ${hidden.length} personal detail(s) (${counts}) as [LABEL] before you read this. Do not write these placeholders into files; ask the user if you need a real value.]`)
       }
+      // the text is rewritten in place; an image or any other block beside it stays
       return {
         kind: 'accept',
-        content: [{ type: 'text', text: `${banners.length ? `${banners.join('\n')}\n\n` : ''}${head}${hidden.length ? replaceSpans(body, cuts, maskLabel) : body}${foot}` }],
+        content: withText(result.content, `${banners.length ? `${banners.join('\n')}\n\n` : ''}${head}${hidden.length ? replaceSpans(body, cuts, maskLabel) : body}${foot}`),
         additionalContexts: [...(downstream.additionalContexts ?? []), ...notices],
       }
     })
@@ -1002,10 +1073,11 @@ export function apply(ctx, config) {
         const main = { context: [asked, did, ...parts].join('\n\n'), answer: answered || '(none)' }
         return JSON.stringify(main).length <= 31000 && stateCost(main) * readers + beside <= REQUEST_TOKENS
       }
+      // the latest reads first; one too long to fit is left out, and the earlier ones still go in while they fit
       const evidence = []
       for (const read of [...reads].reverse()) {
         const part = `[${read.tool}] ${read.brief}\n${read.text}`
-        if (!fits([part, ...evidence.map(entry => entry.part)])) break
+        if (!fits([part, ...evidence.map(entry => entry.part)])) continue
         evidence.unshift({ read, part })
       }
       // the context of the span questions, and where each read sits in it, so that a passage that backs the answer
@@ -1031,12 +1103,20 @@ export function apply(ctx, config) {
         const started = performance.now()
         const context = located([asked])
         haluTask = client.ask({ model: config.spanModel, questions: spanQuestions, inputs: [{ state: { context: context.text, answer: answered } }], signal, timeoutMs: config.hookTimeoutMs, retries: config.hookRetries })
-          .then(answer => ({
-            model: answer.model,
-            ms: performance.now() - started,
-            spans: placeSpans(answer.spans[0]?.halu, answered, { min: config.doneHaluAt }),
-            backed: backing(answer.spans[0]?.evidence, context),
-          }))
+          .then(answer => {
+            // claims System One answered with an error in place were not weighed: no count of unsupported ones
+            const why = spanUnanswered(answer.answers[0], answer.spans[0], 'halu')
+            if (why) {
+              trace({ ev: 's1', reflex: 'done', session: state.id, turn, spans: 'error', error: why })
+              return undefined
+            }
+            return {
+              model: answer.model,
+              ms: performance.now() - started,
+              spans: placeSpans(answer.spans[0]?.halu, answered, { min: config.doneHaluAt }),
+              backed: backing(answer.spans[0]?.evidence, context),
+            }
+          })
           .catch(error => {
             trace({ ev: 's1', reflex: 'done', session: state.id, turn, spans: 'error', error: String(error?.message ?? error) })
             return undefined
@@ -1059,14 +1139,28 @@ export function apply(ctx, config) {
         return
       }
       const answers = Object.assign({}, ...response.answers)
+      // A question System One answered with an error in place (or not at all) is no answer, and never "complete": the
+      // done-check says it could not check, as when System One cannot be asked, and the turn ends as it is. Whether the
+      // changes were checked counts only in a turn that changed files.
+      const wrote = state.calls.some(call => WRITES.includes(call.tool))
+      const gaps = ['complete', 'waiting', ...(wrote ? ['checked'] : [])].map(id => ({ id, why: unanswered(answers[id]) })).filter(gap => gap.why)
+      if (gaps.length) {
+        const error = `${gaps.map(gap => gap.id).join(', ')}: ${gaps[0].why}`
+        trace({ ev: 's1', reflex: 'done', session: state.id, turn, model: response.model, ms: ms(response.ms), error, answers: answersOf(answers) })
+        decision.answer({ model: response.model, ms: ms(response.ms), requestId: response.requestId, answers: answersOf(answers), error: subject(error) })
+        return
+      }
       const complete = yes(answers.complete)
       const checked = yes(answers.checked)
       const waiting = yes(answers.waiting)
       const refusal = answers.r_refusal?.probabilities?.refusal
       const unfinished = complete !== undefined && complete < config.doneCompleteBelow
-      const unchecked = checked !== undefined && checked < 0.3 && state.calls.some(call => ['write', 'edit', 'apply_patch', 'str_replace_editor'].includes(call.tool))
+      const unchecked = checked !== undefined && checked < 0.3 && wrote
+      // claims System One answered with an error in place were not weighed: no count of unsupported ones
+      const haluWhy = one && weighsClaims ? spanUnanswered(response.answers[0], response.spans[0], 'halu') : undefined
+      if (haluWhy) trace({ ev: 's1', reflex: 'done', session: state.id, turn, spans: 'error', error: haluWhy })
       const halu = one && weighsClaims
-        ? { model: response.model, ms: response.ms, spans: placeSpans(response.spans[0]?.halu, answered, { min: config.doneHaluAt }), backed: backing(response.spans[0]?.evidence, context) }
+        ? haluWhy ? undefined : { model: response.model, ms: response.ms, spans: placeSpans(response.spans[0]?.halu, answered, { min: config.doneHaluAt }), backed: backing(response.spans[0]?.evidence, context) }
         : haluTask ? await haluTask : undefined
       const unsupported = halu?.spans ?? []
       const backed = halu?.backed ?? []

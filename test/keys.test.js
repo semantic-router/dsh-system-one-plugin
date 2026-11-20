@@ -155,3 +155,20 @@ test('a key added to an existing dotenv file leaves it readable by its owner onl
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('a dotenv line that names the key with no value takes the new key, so a key fetched once is kept', () => {
+  const dir = mkdtempSync(join(tmpdir(), 's1-env-'))
+  try {
+    const path = join(dir, '.env')
+    writeFileSync(path, '# keys\nVLLM_SR_API_KEY=\nOTHER=1\n', { mode: 0o600 })
+    assert.equal(appendDotenv(path, 'VLLM_SR_API_KEY', 'synthetic-value'), true)
+    assert.equal(readDotenv(path).get('VLLM_SR_API_KEY'), 'synthetic-value')
+    assert.equal(appendDotenv(path, 'VLLM_SR_API_KEY', 'another-value'), false, 'a key that is there stays')
+    assert.equal(readDotenv(path).get('OTHER'), '1')
+    writeFileSync(path, 'export VLLM_SR_API_KEY=""\r\n', { mode: 0o600 })
+    assert.equal(appendDotenv(path, 'VLLM_SR_API_KEY', 'synthetic-value'), true)
+    assert.equal(readDotenv(path).get('VLLM_SR_API_KEY'), 'synthetic-value')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

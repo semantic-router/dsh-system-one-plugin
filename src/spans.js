@@ -143,23 +143,44 @@ export function notPersonal(span, text) {
 
 /**
  * `text` with the `hidden` spans replaced by their `[LABEL]`, and `spans` moved onto the new text, so that an excerpt
- * of what one question marked does not show what another found to be personal. A hidden span that overlaps one of
- * `spans` stays as it is.
+ * of what one question marked does not show what another found to be personal: a hidden span inside or across one of
+ * `spans` is masked there too, and each of `spans` then holds the words of the masked text.
  */
 export function maskAround(text, spans, hidden) {
-  const cuts = hidden.filter(cut => !spans.some(span => span.start < cut.end && span.end > cut.start)).sort((a, b) => a.start - b.start)
+  const cuts = []
   let out = ''
   let cursor = 0
-  const moves = []
-  for (const cut of cuts) {
+  for (const cut of [...hidden].sort((a, b) => a.start - b.start)) {
     if (cut.start < cursor) continue
-    out += text.slice(cursor, cut.start) + maskLabel(cut)
+    out += text.slice(cursor, cut.start)
+    const start = out.length
+    out += maskLabel(cut)
+    cuts.push({ from: cut.start, to: cut.end, start, end: out.length })
     cursor = cut.end
-    moves.push({ at: cut.end, by: out.length - cut.end })
   }
   out += text.slice(cursor)
-  const moved = index => index + (moves.findLast(move => move.at <= index)?.by ?? 0)
-  return { text: out, spans: spans.map(span => ({ ...span, start: moved(span.start), end: moved(span.end) })) }
+  // where a position of the text sits in the masked one; inside a masked span, at its label's start (a span's start)
+  // or end (a span's end)
+  const moved = (index, edge) => {
+    let by = 0
+    for (const cut of cuts) {
+      if (index >= cut.to) {
+        by = cut.end - cut.to
+        continue
+      }
+      if (index > cut.from) return edge === 'start' ? cut.start : cut.end
+      break
+    }
+    return index + by
+  }
+  return {
+    text: out,
+    spans: spans.map(span => {
+      const start = moved(span.start, 'start')
+      const end = moved(span.end, 'end')
+      return { ...span, start, end, text: out.slice(start, end) }
+    }),
+  }
 }
 
 /**
@@ -292,11 +313,11 @@ export function unnumber(text) {
   return { text: out.join('\n'), at }
 }
 
-/** How many spans of each label, most first. */
+/** How many spans of each label, most first; a label of any name (`constructor`, `__proto__`) counts as its own. */
 export function labelCounts(spans) {
-  const counts = {}
-  for (const span of spans) counts[span.label || 'PII'] = (counts[span.label || 'PII'] ?? 0) + 1
-  return Object.fromEntries(Object.entries(counts).sort((a, b) => b[1] - a[1]))
+  const counts = new Map()
+  for (const span of spans) counts.set(span.label || 'PII', (counts.get(span.label || 'PII') ?? 0) + 1)
+  return Object.fromEntries([...counts].sort((a, b) => b[1] - a[1]))
 }
 
 /**

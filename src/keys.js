@@ -130,17 +130,29 @@ export function readDotenv(path) {
 }
 
 /**
- * Add NAME=value to a dotenv file unless the name is already there. The file, new or not, is left readable by its
- * owner only.
+ * Add NAME=value to a dotenv file unless the name already holds a value there; a line that names it with an empty
+ * value (`NAME=`) takes the value in its place, so that a key fetched once is kept, not fetched again on every start.
+ * The file, new or not, is left readable by its owner only.
  */
 export function appendDotenv(path, name, value) {
   const current = readDotenv(path)
-  if (current.has(name)) return false
+  if (current.get(name)) return false
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
   let text = ''
   try {
     text = readFileSync(path, 'utf8')
   } catch {}
+  if (current.has(name)) {
+    const empty = new RegExp(String.raw`^([ \t]*(?:export[ \t]+)?${name}[ \t]*=)[ \t]*(?:''|"")?[ \t]*(\r?)$`, 'gm')
+    const fd = openSync(path, 'w', 0o600)
+    try {
+      fchmodSync(fd, 0o600)
+      writeSync(fd, text.replace(empty, (_line, head, cr) => `${head}${value}${cr}`))
+    } finally {
+      closeSync(fd)
+    }
+    return true
+  }
   const fd = openSync(path, 'a', 0o600)
   try {
     fchmodSync(fd, 0o600)
