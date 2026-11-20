@@ -103,6 +103,30 @@ test('fetch is wrapped while held: inside a router call its chat request gets th
   assert.equal(globalThis.fetch, fake.fetch, 'the last holder restores it')
 })
 
+test('inside a router call only its chat request to the router\'s host gets the session and trace; a chat request to another host gets none', async t => {
+  const before = globalThis.fetch
+  const fake = fakeFetch()
+  globalThis.fetch = fake.fetch
+  const release = holdFetch()
+  t.after(() => {
+    release()
+    globalThis.fetch = before
+  })
+  const routes = []
+  const call = { session: SESSION, trace: true, seen: route => routes.push(route) }
+  // a request nested in the call, to another provider's chat endpoint, after the router's own and before its retry
+  for await (const chunk of withinCall(call, llmStream(adapterStream()))) assert.ok(chunk)
+  await inCall(call, () => globalThis.fetch('https://other-provider.example/v1/chat/completions', { method: 'POST', headers: { a: '1' }, body: '{}' }))
+  for await (const chunk of withinCall(call, llmStream(adapterStream()))) assert.ok(chunk)
+  const named = entry => Object.keys(entry.headers).filter(name => name.startsWith('x-')).sort()
+  assert.deepEqual(fake.seen.map(entry => [new URL(entry.url).host, named(entry)]), [
+    ['relay:9090', ['x-conversation-id', 'x-session-id', 'x-vsr-debug']],
+    ['other-provider.example', []],
+    ['relay:9090', ['x-conversation-id', 'x-session-id', 'x-vsr-debug']],
+  ])
+  assert.equal(routes.length, 2, 'the other host\'s answer names no route')
+})
+
 test('an answer that is not a success records no route, and its stream ends as it would have', async t => {
   const before = globalThis.fetch
   globalThis.fetch = async () => new Response('{"error":{}}', { status: 429, headers: { 'x-vsr-selected-model': 'deepseek/deepseek-v4.1-flash' } })

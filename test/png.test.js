@@ -131,3 +131,12 @@ test('annotating draws a box outline outside the box and a click point, on a cop
   assert.deepEqual(at(0, 39), [255, 255, 255])
   assert.deepEqual(decodePng(original).data, image.data)
 })
+
+test('an RGB or grey PNG\'s transparent colour (its tRNS key) stays transparent when it is decoded and drawn on', () => {
+  // two pixels each: the key colour, then another
+  const rgb = pngOf({ width: 2, height: 1, color: 2, pixels: Buffer.from([255, 0, 0, 0, 0, 255]), filters: [0], alpha: [0, 255, 0, 0, 0, 0] })
+  assert.deepEqual([...decodePng(rgb).data], [255, 0, 0, 0, 0, 0, 255, 255])
+  assert.deepEqual([...decodePng(annotatePng(rgb, [])).data], [255, 0, 0, 0, 0, 0, 255, 255])
+  const grey = pngOf({ width: 2, height: 1, color: 0, pixels: Buffer.from([7, 200]), filters: [0], alpha: [0, 7] })
+  assert.deepEqual([...decodePng(grey).data], [7, 7, 7, 0, 200, 200, 200, 255])
+})

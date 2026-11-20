@@ -1,5 +1,85 @@
 # Changelog
 
+## 0.9.1 (2026-11-20)
+
+What System One cannot answer is never read as safe, error results are screened and masked like any other, and
+`system_one` keeps hidden data out of what System Two reads, keeps the shape of what it copies, and reads every item as
+written.
+
+- **An answer System One gives as an error is no answer.** The Decision API can answer one question of a request with
+  an error in place (`invalid_question`) beside the answers of the others. The guard read the missing risk as safe and
+  allowed the call, even with `guardOnError: deny`; the shield scored the passage 0 and called the result clean;
+  privacy masked nothing and said the result was clean; the done-check stopped the turn as complete. Now the guard
+  gives such a call `guardOnError`, as when System One cannot be reached, unless what it did answer already asks about
+  the call or blocks it; the shield and privacy pass on what they could not screen or mask as they are, as when System
+  One cannot be asked, and their cards say how much; and the done-check says it could not check, ending the turn as it
+  is.
+- **Error results are screened and masked.** The shield and privacy skipped every result marked as an error, so a
+  fetched page's error body or a command's error output reached System Two unscreened and unmasked. They now read an
+  error result as any other.
+- **Words that imitate a harness note are screened.** The shield never screened a line that matched one of DeepSeek
+  Harness's own notes word for word (`[sandbox: escalation available — …]`), wherever it came from. It now takes such
+  a line for the harness's only where the harness writes it, among the notes that end a shell's or a background job's
+  output; the same words in a page, a file or the middle of a command's output are screened as any text is. A result
+  the shield or privacy rewrites keeps its images and every other block beside the text.
+- **What `system_one` hides stays hidden.** An excerpt of a custom span question showed personal data that a pii
+  question had hidden, where the two overlapped; with `redact` and a custom label instead of a pii question, the
+  summary's examples, the first rows' `<id>_spans` and Chat's excerpts showed the words the copy replaced, and an id the
+  label marked stayed as it was. Now another question's marks show hidden data by its label only, whatever a redacted
+  copy replaces is kept out of what System Two reads as personal data is, an id it marks is named by a pseudonym, and
+  an id named by a pseudonym no longer shows in its item's excerpt.
+- **Redacted copies keep their shape, and names that are personal data.** A nested object with a marked number became a
+  string (`'{"phone":[PHONE_NUMBER]}'`), and an array record became an object (`{"0": …}`); both now keep their shape,
+  the marked number becoming its `[LABEL]`. A field's name that holds personal data, as `{"alice@example.test": "hello"}`
+  has, or a key inside a value, takes its pseudonym in the copy. An id or a JSON object's key shaped as an IPv6 address,
+  or as an email address with its domain in any script, is now known as personal data, and four numbers between dots
+  are an IP address only when each is a byte.
+- **No CSV cell is a formula.** A cell that starts as a spreadsheet formula does (`=`, `+`, `-`, `@`, a tab or a carriage
+  return), as a record id of `=1+1`, now starts with a `'` in the results and in a redacted CSV copy; a plain number
+  stays as it is. A CSV keeps every row and cell: a record of empty cells, a header written twice (its second column read
+  as `<name>_2`) and the cells past the header (`column_<n>`), each said in the notes.
+- **Every item is read as written.** A number or `true` in a JSON file was read as an empty text and asked about as
+  "An image."; a text file's lines lost their indentation; an item or a field longer than `toolMaxChars` was cut
+  without a word unless a copy was asked for; and a source's line numbers left out the blank lines it starts with. Each
+  is fixed, and a cut is said in the notes. Ids are unique across a call's sources: an inline item no longer shares the
+  id `1` with a file's first row, and two images of one name in two folders are named by their paths.
+- **Questions are read as written.** A question named `threshold`, `type`, `over` or `instructions` was taken for an
+  option beside the questions and dropped unseen; it is a question whenever what it holds can be no such option, and
+  an option no question takes is said. Ids, options and labels named `__proto__` or `constructor` keep their place;
+  criteria named `false` and `true` make a yes/no question; a span threshold may be 0 or 1, as System One takes them;
+  and valid JSON that quotes the model's tool-call markup is no longer split as if it were that markup.
+- **Requests fit System One's limits.** Nine items of eight questions went out as one request of 72 questions, which
+  System One refuses; a request now holds at most 64. A call of both images and texts asks each item what it can
+  answer, so a text is never sent a box question, nor an image a span question. `system_one_screen` checks a
+  screenshot larger than 8 MB against the chosen model's own limit, as System Duo publishes it (`vllm-sr/vela3-turbo`
+  8,000,000 bytes, `vllm-sr/d3-ultra` 16,777,216), instead of one fixed 10 MiB.
+- **Screens and boxes.** An annotated copy named `.jpg` or `.webp` is written as the PNG it is, under `.png`; the pixel
+  to click never falls outside the screenshot; a target or a box is found by its confidence as the model gives it, so
+  0.3996 is below 0.4; and the transparent colour of an RGB or grey PNG stays transparent in its copy. Score levels that
+  share the words before their colon (`Low: can wait`, `Low: this week`) each keep their count in the summary.
+- **Windows.** An image's id is its file's name, the results of an extensionless file in a dot-named folder go beside
+  it, and the cards show Windows paths relative to the working directory.
+- **The router's headers go to the router.** Inside a router call, the session and trace headers went with any request
+  to a path ending in `/chat/completions`, on any host. They now go to the router's host only: the base URL DeepSeek
+  Harness 0.2.2 names, or with 0.2.1 the host of the call's first chat request; a model call to another provider made
+  inside it gets none.
+- **First start.** A `~/.dsh/.env` line that names the key with no value (`VLLM_SR_API_KEY=`) now takes the new key, so
+  a headless run no longer fetches another key on every start; a credential store that cannot be read is said under the
+  request, as a refused key is; and two processes that make the pseudonym key at once share one key, and an empty key
+  file is replaced.
+- **The trace.** A trace an earlier version wrote that cannot be replaced, as when a program holds it open on Windows,
+  is scrubbed in place; one that cannot be scrubbed at all is never written to, and a warning says so.
+- **Smaller fixes.** The done-check still weighs earlier short reads when a later one is too long to fit; a cancel ends
+  the client's wait to retry after a network error at once; and Chat's thumbnail cache revokes every image URL it
+  drops, also when more than 96 load at once.
+- **`vllm-sr/auto`'s window.** The model catalog gave `vllm-sr/auto` a context window of 131,072 tokens, an eighth of
+  Norn-1's, so DeepSeek Harness compacted long sessions far too early. It now gives Norn-1's 1,048,576 tokens and an
+  answer of at most 32,000, as [the docs](https://app.vllm-sr.ai/docs) give them. A profile patch that replaces the
+  `vllm-sr` provider row replaces these values too.
+
+Unchanged: every option and its default, the tools' parameters, the record format (fields only added: `unscreened` on a
+shield record, `found` on a box answer), and the README's and System Duo's install lines (unversioned).
+
 ## 0.9.0 (2026-11-19)
 
 The reflexes read every tool that brings text in or acts, and all of what they read; the `system_one` tool never

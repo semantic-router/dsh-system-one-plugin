@@ -22,9 +22,12 @@ export function subject(text, max = 200) {
 }
 
 const escaped = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-// a path starts after a separator and ends at one, so /work does not match inside /work2 or /x/work
+// a path starts after a separator and ends at one, so /work does not match inside /work2 or /x/work; Windows' paths
+// separate with either slash
 const START = String.raw`(?<=^|[\s'"=:(])`
-const END = String.raw`(?=$|[\s'"/;&|)<>,])`
+const END = String.raw`(?=$|[\s'"/\\;&|)<>,])`
+// a folder as a pattern, without its trailing separators, either slash matching the other in a Windows path
+const folder = dir => escaped(dir.replace(/[\\/]+$/, '')).replace(/\\\\|\//g, String.raw`[\\/]`)
 
 /**
  * A call as the cards show it: paths in the session's working directory relative to it, the home directory as `~`,
@@ -32,10 +35,10 @@ const END = String.raw`(?=$|[\s'"/;&|)<>,])`
  */
 export function relativeTo(text, workspace, home) {
   let out = String(text ?? '')
-  const root = dir => (typeof dir === 'string' && dir.replace(/\/+$/, '').length > 1 ? escaped(dir.replace(/\/+$/, '')) : undefined)
+  const root = dir => (typeof dir === 'string' && dir.replace(/[\\/]+$/, '').length > 1 ? folder(dir) : undefined)
   const work = root(workspace)
   if (work) {
-    out = out.replace(new RegExp(`${START}${work}/`, 'g'), '').replace(new RegExp(`${START}${work}${END}`, 'g'), '.')
+    out = out.replace(new RegExp(String.raw`${START}${work}[\\/]`, 'g'), '').replace(new RegExp(`${START}${work}${END}`, 'g'), '.')
     out = out.replace(/^cd \.\s*&&\s*/, '')
   }
   const own = root(home)

@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { REQUEST_TOKENS, compactAnswer, requestSlices, stateCost, unavailable, unavailableText } from './client.js'
+import { QUESTIONS_PER_REQUEST, REQUEST_TOKENS, compactAnswer, requestSlices, stateCost, unavailable, unavailableText } from './client.js'
 import { formatOf, loadItems } from './items.js'
 import { inputAt, kindAt, mustBeFile, noFile, sameFile } from './paths.js'
 import { deniedText, mayWrite } from './permissions.js'
@@ -11,7 +11,7 @@ import { annotatePng, undrawable } from './png.js'
 import { personalShape, pseudonym } from './pseudonyms.js'
 import { ROUTER_SIGNALS, SENSITIVE_LABELS } from './questions.js'
 import { csvCell, everywhere, joined, redactItem, writeRedacted } from './redact.js'
-import { kindOf, planQuestions, readQuestions, splitArguments, unanswerable } from './rubric.js'
+import { kindOf, planQuestions, put, readQuestions, splitArguments, unanswerable } from './rubric.js'
 import { apart, excerpts, labelCounts, maskAround, notPersonal, placeSpans, trimSpan } from './spans.js'
 import { clip } from './trace.js'
 
@@ -69,9 +69,12 @@ For one screenshot you act on (where to click, whether an action worked), use sy
 // the tool's parameters, for arguments that ran into questions (splitArguments)
 const PARAMETERS = Object.fromEntries(['questions', 'file', 'text_field', 'id_field', 'items', 'images', 'context', 'sources', 'state_fields', 'redact', 'annotate', 'output', 'model', 'span_model'].map(name => [name, true]))
 
-/** Where a call's rows go by default: beside its file, or beside the one folder its images are in. */
+/**
+ * Where a call's rows go by default: beside its file, or beside the one folder its images are in. Only the file's own
+ * extension goes, after the last separator of either kind, so that `project.v1\tickets` keeps its folder on Windows.
+ */
 function defaultOutput(cwd, file, images) {
-  if (file) return `${file.replace(/\.[^./]+$/, '')}.s1.jsonl`
+  if (file) return `${file.replace(/(?<=[^./\\])\.[^./\\]+$/, '')}.s1.jsonl`
   const folders = [...new Set((images ?? []).map(path => dirname(path)))]
   const within = folders.length === 1 ? relative(cwd, folders[0]) : ''
   return within && !within.startsWith('..') && !isAbsolute(within) ? `${folders[0]}.s1.jsonl` : 'system-one-results.jsonl'
@@ -102,29 +105,57 @@ function levelBase(criteria) {
   return numbers.every((number, index) => Number(number) === first + index) ? first : 0
 }
 
-function summarize(questions, rows, asked) {
+/** How many of `values` there are of each, in the order they first come: a value of any name counts as its own. */
+function tally(values) {
+  const counts = new Map()
+  for (const [value, n] of values) counts.set(value, (counts.get(value) ?? 0) + n)
+  return counts
+}
+
+/**
+ * The names a score's levels go by in the summary: the words before each one's colon (`Low` of "Low: can wait"), or
+ * the whole level where two would share them, each name its own.
+ */
+function levelNames(criteria) {
+  const short = criteria.map(level => String(level).split(':')[0])
+  const names = new Set(short).size === short.length ? short : criteria.map(String)
+  const seen = new Set()
+  return names.map(name => {
+    let own = name
+    for (let n = 2; seen.has(own); n++) own = `${name} (${n})`
+    seen.add(own)
+    return own
+  })
+}
+
+/**
+ * The call's summary for System Two. `hidden` holds the span questions whose words it never shows (personal data, or
+ * what a redacted copy replaces); `applies(id, index)` whether a question was asked of the item at `index` at all, as a
+ * box question is not of a text.
+ */
+function summarize(questions, rows, asked, { hidden = new Set(), applies = () => true } = {}) {
   const summary = {}
   for (const [id, question] of Object.entries(questions)) {
-    const answers = rows.map(row => ({ id: row.id, a: row.answers[id] })).filter(entry => entry.a && !entry.a.error)
-    const failed = rows.length - answers.length
+    const asks = rows.filter((_, index) => applies(id, index))
+    const answers = asks.map(row => ({ id: row.id, a: row.answers[id] })).filter(entry => entry.a && !entry.a.error)
+    const failed = asks.length - answers.length
     // why they failed, once, so that System Two can fix the question
-    const why = failed ? rows.map(row => row.answers[id]).find(a => a?.error) : undefined
+    const why = failed ? asks.map(row => row.answers[id]).find(a => a?.error) : undefined
     const error = why ? clip([why.error, why.reason].filter(value => typeof value === 'string' && value).join(': '), 200) : undefined
     const kind = asked[id].kind
     if (kind === 'span') {
-      const labels = {}
-      for (const { a } of answers) for (const [label, n] of Object.entries(a.labels)) labels[label] = (labels[label] ?? 0) + n
+      const labels = tally(answers.flatMap(({ a }) => Object.entries(a.labels)))
       const marked = answers.filter(({ a }) => a.n > 0)
       const top = [...marked].sort((x, y) => y.a.n - x.a.n || y.a.p - x.a.p)
-      summary[id] = {
+      put(summary, id, {
         type: 'span',
         ...(question.preset ? { preset: question.preset } : {}),
-        labels: Object.fromEntries(Object.entries(labels).sort((x, y) => y[1] - x[1])),
+        labels: Object.fromEntries([...labels].sort((x, y) => y[1] - x[1])),
         items: marked.length,
         of: answers.length,
         top: top.slice(0, 8).map(({ id: itemId, a }) => [itemId, a.n]),
-        // personal data stays in the results file, not in what System Two reads
-        ...(question.preset === 'pii' ? {} : {
+        // personal data, and what a redacted copy replaces, stay in the results file, not in what System Two reads
+        ...(hidden.has(id) ? {} : {
           examples: top.slice(0, 6).map(({ id: itemId, a }) => {
             const best = a.spans.reduce((x, y) => (y.p > x.p ? y : x))
             return [itemId, best.label, clip(best.text.replace(/\s+/g, ' ').trim(), 120), best.p, ...(best.source ? [placeOf(best)] : [])]
@@ -132,16 +163,15 @@ function summarize(questions, rows, asked) {
         }),
         failed,
         ...(error ? { error } : {}),
-      }
+      })
     } else if (question.type === 'choice' || question.signal) {
-      const counts = {}
-      for (const { a } of answers) counts[a.choice] = (counts[a.choice] ?? 0) + 1
+      const counts = Object.fromEntries(tally(answers.map(({ a }) => [a.choice, 1])))
       const unsure = answers.filter(({ a }) => a.confidence < 0.6).map(({ id: itemId }) => itemId)
-      summary[id] = { type: 'choice', ...(question.signal ? { signal: question.signal } : {}), counts, unsure: unsure.slice(0, 12), unsureCount: unsure.length, failed, ...(error ? { error } : {}) }
+      put(summary, id, { type: 'choice', ...(question.signal ? { signal: question.signal } : {}), counts, unsure: unsure.slice(0, 12), unsureCount: unsure.length, failed, ...(error ? { error } : {}) })
     } else if (question.type === 'noul') {
       const sorted = [...answers].sort((x, y) => y.a.yes - x.a.yes)
       const yesCount = answers.filter(({ a }) => a.yes >= 0.5).length
-      summary[id] = { type: 'noul', yes: yesCount, no: answers.length - yesCount, top: sorted.slice(0, 8).map(({ id: itemId, a }) => [itemId, a.yes]), failed, ...(error ? { error } : {}) }
+      put(summary, id, { type: 'noul', yes: yesCount, no: answers.length - yesCount, top: sorted.slice(0, 8).map(({ id: itemId, a }) => [itemId, a.yes]), failed, ...(error ? { error } : {}) })
     } else if (question.type === 'score') {
       const levels = question.criteria.map(() => 0)
       const base = levelBase(question.criteria)
@@ -151,18 +181,18 @@ function summarize(questions, rows, asked) {
         levels[Math.min(levels.length - 1, Math.max(0, Math.round(a.score - base)))]++
       }
       const sorted = [...answers].sort((x, y) => y.a.score - x.a.score)
-      summary[id] = {
+      put(summary, id, {
         type: 'score',
         mean: answers.length ? Math.round((total / answers.length) * 100) / 100 : null,
-        levels: Object.fromEntries(question.criteria.map((label, index) => [String(label).split(':')[0], levels[index]])),
+        levels: Object.fromEntries(levelNames(question.criteria).map((name, index) => [name, levels[index]])),
         top: sorted.slice(0, 8).map(({ id: itemId, a }) => [itemId, a.score]),
         failed,
         ...(error ? { error } : {}),
-      }
+      })
     } else {
-      const seen = answers.filter(({ a }) => a.box && a.confidence >= FOUND_AT)
+      const seen = answers.filter(({ a }) => a.box && a.found)
       const corners = ({ left, top, right, bottom }) => [left, top, right, bottom].map(value => Math.round(value * 1000) / 1000)
-      summary[id] = { type: 'box', found: seen.length, of: answers.length, boxes: seen.slice(0, 12).map(({ id: itemId, a }) => [itemId, corners(a.box), a.confidence]), failed, ...(error ? { error } : {}) }
+      put(summary, id, { type: 'box', found: seen.length, of: answers.length, boxes: seen.slice(0, 12).map(({ id: itemId, a }) => [itemId, corners(a.box), a.confidence]), failed, ...(error ? { error } : {}) })
     }
   }
   return summary
@@ -202,36 +232,41 @@ function columnClash(questions, asked) {
   return undefined
 }
 
-function flatRow(row, questions, asked) {
+/**
+ * One row as a CSV and the first rows have it: a column per answer. `hidden` holds the span questions whose words stay
+ * out of it; `unasked` the questions not asked of this item, which take no cell.
+ */
+function flatRow(row, questions, asked, { hidden = new Set(), unasked = new Set() } = {}) {
   const flat = { id: row.id, ...(row.pseudonym ? { pseudonym: row.pseudonym } : {}) }
   for (const [id, question] of Object.entries(questions)) {
+    if (unasked.has(id)) continue
     const a = row.answers[id]
     if (!a || a.error) {
-      flat[id] = 'error'
+      put(flat, id, 'error')
       continue
     }
     if (asked[id].kind === 'span') {
-      flat[id] = a.n
-      if (a.n) flat[`${id}_labels`] = Object.entries(a.labels).map(([label, n]) => `${label} ${n}`).join('; ')
-      if (a.n && question.preset !== 'pii') flat[`${id}_spans`] = a.spans.map(span => `${span.label}: ${span.text}`).join(' | ')
+      put(flat, id, a.n)
+      if (a.n) put(flat, `${id}_labels`, Object.entries(a.labels).map(([label, n]) => `${label} ${n}`).join('; '))
+      if (a.n && !hidden.has(id)) put(flat, `${id}_spans`, a.spans.map(span => `${span.label}: ${span.text}`).join(' | '))
     } else if (question.type === 'choice' || question.signal) {
-      flat[id] = a.choice
-      flat[`${id}_confidence`] = a.confidence
+      put(flat, id, a.choice)
+      put(flat, `${id}_confidence`, a.confidence)
     } else if (question.type === 'noul') {
-      flat[`${id}_yes`] = a.yes
+      put(flat, `${id}_yes`, a.yes)
     } else if (question.type === 'score') {
-      flat[id] = a.score
+      put(flat, id, a.score)
     } else {
-      flat[id] = JSON.stringify(a.box)
-      flat[`${id}_confidence`] = a.confidence
+      put(flat, id, JSON.stringify(a.box))
+      put(flat, `${id}_confidence`, a.confidence)
     }
   }
   return flat
 }
 
-async function writeResults(path, rows, questions, asked) {
+async function writeResults(path, rows, questions, asked, show = () => ({})) {
   if (extname(path).toLowerCase() === '.csv') {
-    const flat = rows.map(row => flatRow(row, questions, asked))
+    const flat = rows.map((row, index) => flatRow(row, questions, asked, show(index)))
     const columns = [...new Set(flat.flatMap(row => Object.keys(row)))]
     // a header is a cell like any other: a question id with a comma, a quote or a line break keeps its column
     const lines = [columns.map(csvCell).join(','), ...flat.map(row => columns.map(column => csvCell(row[column])).join(','))]
@@ -257,6 +292,8 @@ function renderSummary(value) {
       if (s.preset === 'halu') lines.push(`- ${id}: words the sources do not support in ${items}${s.examples.length ? `: ${listed(s.examples.map(([itemId, , text]) => `${itemId} ("${text}")`), 6)}` : ''}`)
       else if (s.preset === 'evidence') lines.push(`- ${id}: backed by the sources: ${items}${s.examples.length ? `; e.g. ${listed(s.examples.map(([itemId, , text, , where]) => `${itemId}: "${text}"${where ? ` (${where})` : ''}`), 3)}` : ''}`)
       else if (s.preset === 'pii') lines.push(`- ${id}: personal data in ${items}${counts.length ? `: ${counts.join(', ')}; most in ${listed(s.top.map(([itemId, n]) => `${itemId} (${n})`))}` : ''}`)
+      // what a redacted copy replaces is counted, as personal data is, and its words are not shown
+      else if (!s.examples) lines.push(`- ${id}: ${counts.length ? `${counts.join(', ')} in ${items}; most in ${listed(s.top.map(([itemId, n]) => `${itemId} (${n})`))}` : `nothing marked in ${items}`}`)
       else lines.push(`- ${id}: ${counts.length ? counts.join(', ') : 'nothing marked'} in ${items}${s.examples.length ? `; e.g. ${listed(s.examples.map(([itemId, label, text]) => `${itemId} ${label} "${text}"`), 4)}` : ''}`)
     } else if (s.type === 'choice') {
       lines.push(`- ${id}${s.signal ? ` (signal ${s.signal})` : ''}: ${Object.entries(s.counts).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k} ${n}`).join(', ')}${s.unsureCount ? `; unsure (confidence < 0.6): ${s.unsureCount} [${s.unsure.join(', ')}]` : ''}`)
@@ -306,27 +343,33 @@ function fieldsOf(value) {
   return map
 }
 
-/** The sources' text, as one context with a `[path]` line before each file, and where each file starts in it. */
+/**
+ * The sources' text, as one context with a `[path]` line before each file, and where each file starts in it, and how
+ * many lines its text starts below the file's first (`skipped`: the blank lines the context leaves out).
+ */
 async function readSources(paths, cwd, before) {
   const blocks = []
   let context = before ? `${before}\n\n` : ''
   for (const [index, path] of paths.entries()) {
     const full = resolve(cwd, path)
-    const text = (await readFile(full, 'utf8')).trim()
+    const raw = await readFile(full, 'utf8')
+    const text = raw.trim()
+    const skipped = raw.slice(0, raw.length - raw.trimStart().length).match(/\n/g)?.length ?? 0
     const shown = relative(cwd, full) || full
     if (index > 0) context += '\n\n'
     context += `[${shown}]\n`
-    blocks.push({ source: shown, start: context.length, text })
+    blocks.push({ source: shown, start: context.length, text, skipped })
     context += text
   }
   if (context.length > SOURCE_CHARS) throw new Error(`the sources hold ${context.length} characters, and System One reads at most ${SOURCE_CHARS}: pass fewer or shorter files`)
   return { context, blocks }
 }
 
+// the file and line an offset of the sources' context falls on, counted in the file as it is
 function sourceAt(blocks, index) {
   const block = [...blocks].reverse().find(entry => entry.start <= index)
   if (!block) return undefined
-  return { source: block.source, line: 1 + (block.text.slice(0, index - block.start).match(/\n/g)?.length ?? 0) }
+  return { source: block.source, line: 1 + block.skipped + (block.text.slice(0, index - block.start).match(/\n/g)?.length ?? 0) }
 }
 
 /** Where an evidence span is: a source's file and line, or the record's own field that it read before the sources. */
@@ -465,11 +508,18 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
         maxItems: config.toolMaxItems,
         maxChars: config.toolMaxChars,
         cwd,
+        notes,
       })
-      const hasImages = items.some(item => item.images)
+      // what System One reads of an item longer than it reads is said, not cut unseen
+      const long = items.filter(item => item.cut).length
+      if (long) notes.push(`${long} item(s) are longer than ${config.toolMaxChars} characters: System One read the first ${config.toolMaxChars} of each`)
+      // the images come first, then the texts (loadItems)
+      const imageCount = items.filter(item => item.images).length
+      const hasImages = imageCount > 0
+      const hasTexts = imageCount < items.length
       // a question these items cannot answer at all (a span question of images, a box question of text) is left out
       // when others remain, and said
-      const cannot = Object.entries(questions).map(([id, question]) => [id, unanswerable(question, { images: hasImages })]).filter(([, why]) => why)
+      const cannot = Object.entries(questions).map(([id, question]) => [id, unanswerable(question, { images: hasImages, texts: hasTexts })]).filter(([, why]) => why)
       if (cannot.length && cannot.length < Object.keys(questions).length) {
         questions = Object.fromEntries(Object.entries(questions).filter(([id]) => !cannot.some(([gone]) => gone === id)))
         for (const [id, why] of cannot) notes.push(`not asked: ${id} (${why})`)
@@ -486,7 +536,7 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
       if (copies) {
         const marking = Object.values(questions).filter(question => kindOf(question) === 'span' && !question.signal && question.preset !== 'halu' && question.preset !== 'evidence')
         const cut = items.find(item => item.cut)
-        const none = hasImages ? 'the items are images'
+        const none = hasImages ? (hasTexts ? 'the items include images' : 'the items are images')
           : parts ? 'halu, evidence, sources and state_fields mark words against sources, not words to replace'
             : cut ? `item ${cut.id} is longer than ${config.toolMaxChars} characters, and a copy needs each item whole` : undefined
         if (none) {
@@ -503,7 +553,19 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
       }
       const model = args.model || config.model
       const spanModel = args.span_model || config.spanModel
-      const { groups, asked } = planQuestions(questions, { model, spanModel, parts, images: hasImages })
+      // Each kind of item is asked what it can answer: an image the choice, noul, score and box questions, a text all
+      // but box questions. A call of one kind is planned whole, so that a question it cannot answer is refused, with how.
+      const kinds = [hasImages && { images: true, from: 0, to: imageCount }, hasTexts && { images: false, from: imageCount, to: items.length }].filter(Boolean)
+      const plans = kinds.map(kind => {
+        const fit = kinds.length > 1 ? Object.fromEntries(Object.entries(questions).filter(([, question]) => !unanswerable(question, { images: kind.images }))) : questions
+        return { ...kind, ...planQuestions(fit, { model, spanModel, parts, images: kind.images }) }
+      })
+      const asked = {}
+      for (const plan of plans) for (const [id, entry] of Object.entries(plan.asked)) if (!Object.hasOwn(asked, id)) put(asked, id, entry)
+      const groups = plans.flatMap(plan => plan.groups.map(group => ({ ...group, images: plan.images, from: plan.from, to: plan.to })))
+      // whether a question was asked of the item at `index`, as a box question is not of a text in a call with images
+      const applies = (id, index) => plans.some(plan => index >= plan.from && index < plan.to && Object.hasOwn(plan.asked, id))
+      const unaskedOf = index => new Set(Object.keys(questions).filter(id => !applies(id, index)))
       // each answer takes a column of its own in a CSV and in the first rows, beside the item's id
       const clash = columnClash(questions, asked)
       if (clash) throw new Error(clash)
@@ -544,15 +606,23 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
       const context = args.context?.trim()
       const sources = grounded ? await readSources(sourcePaths, cwd, context) : undefined
 
+      // a field read for state_fields is cut at toolMaxChars, as an item is, and said
+      let fieldsCut = 0
       const states = items.map(item => {
-        if (!parts) return { state: [context, item.text].filter(Boolean).join('\n\n') || 'An image.', shift: context && item.text ? context.length + 2 : 0, images: item.images }
+        if (!parts) {
+          // an image is what its state is about; an empty text says so, and is no image
+          const read = [context, item.text].filter(Boolean).join('\n\n')
+          return { state: read || (item.images ? 'An image.' : '(empty)'), shift: context && item.text ? context.length + 2 : 0, images: item.images }
+        }
         const state = {}
         if (fields) {
           if (typeof item.record !== 'object' || item.record === null) throw new Error('state_fields reads the fields of records: pass a .jsonl, .json or .csv file')
           for (const [part, field] of Object.entries(fields)) {
             const value = item.record[field]
             if (value === undefined) throw new Error(`state_fields: "${field}" is not a field of item ${item.id}`)
-            state[part] = (typeof value === 'string' ? value : JSON.stringify(value)).slice(0, config.toolMaxChars)
+            const read = typeof value === 'string' ? value : JSON.stringify(value)
+            if (read.length > config.toolMaxChars) fieldsCut++
+            state[part] = read.slice(0, config.toolMaxChars)
           }
         }
         if (grounded) {
@@ -564,20 +634,25 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
         }
         return { state, shift: 0 }
       })
-      // each request stays within the Decision API's estimate, which counts an item's state once for every question
+      if (fieldsCut) notes.push(`${fieldsCut} field value(s) are longer than ${config.toolMaxChars} characters: System One read the first ${config.toolMaxChars} of each`)
+      // each request stays within the Decision API's estimate, which counts an item's state once for every question, and
+      // within the questions one request may ask
       const jobs = []
       for (const group of groups) {
         const asks = Object.keys(group.questions).length
+        if (asks > QUESTIONS_PER_REQUEST) throw new Error(`${asks} questions of ${group.model} are more than one request may ask (${QUESTIONS_PER_REQUEST}): ask fewer questions per call`)
         // a group of signals that read one part of each item reads that part as its text
         const texts = group.reads ? states.map(entry => ({ ...entry, state: String(entry.state[group.reads] ?? '') })) : states
-        if (!hasImages) {
-          const heaviest = Math.max(...texts.map(({ state }) => stateCost(state)))
+        const kindOfItems = texts.slice(group.from, group.to)
+        if (!group.images) {
+          const heaviest = Math.max(...kindOfItems.map(({ state }) => stateCost(state)))
           if (heaviest * asks > REQUEST_TOKENS) {
             throw new Error(`${asks} question(s) of ${group.model} over an item of about ${heaviest} bytes are more than one request may read (${REQUEST_TOKENS} tokens, each question reading the item again): ask fewer questions per call, or pass shorter items or sources`)
           }
         }
-        const slices = hasImages ? texts.map((_, start) => ({ start, count: 1 })) : requestSlices(texts.map(({ state }) => state), asks)
-        for (const { start, count } of slices) jobs.push({ group, start, count, texts })
+        // an image goes in a request of its own
+        const slices = group.images ? kindOfItems.map((_, start) => ({ start, count: 1 })) : requestSlices(kindOfItems.map(({ state }) => state), asks)
+        for (const { start, count } of slices) jobs.push({ group, start: group.from + start, count, texts })
       }
       const started = performance.now()
       // Each request is settled on its own: the items of one that failed carry its error in place of their answers, and
@@ -614,7 +689,7 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
         const said = clip(String(job.error?.message ?? job.error), 200)
         const answer = job.skipped ? { error: 'not_asked', reason: `another request of this call failed first: ${said}` } : { error: unavailable(job.error) ? 'unavailable' : 'request_failed', reason: said }
         for (let index = job.start; index < job.start + job.count; index++) {
-          for (const id of Object.values(job.group.ids)) rows[index].answers[id] = { ...answer }
+          for (const id of Object.values(job.group.ids)) put(rows[index].answers, id, { ...answer })
         }
       }
       let partial
@@ -633,33 +708,39 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
         inputTokens += response.inputTokens
         response.answers.forEach((answers, offset) => {
           const index = start + offset
+          // an answer and its spans under the question's own id only: an id such as __proto__ names no other field
+          const given = (record, wire) => (record && Object.hasOwn(record, wire) ? record[wire] : undefined)
           for (const [wire, id] of Object.entries(group.ids)) {
             const entry = asked[id]
-            const answer = answers?.[wire]
+            const answer = given(answers, wire)
+            const marked = given(response.spans[offset], wire)
             if (entry.kind !== 'span') {
               const compact = compactAnswer(answer)
               const base = questions[id].type === 'score' ? levelBase(questions[id].criteria) : 0
-              rows[index].answers[id] = base && typeof compact.score === 'number' ? { ...compact, score: round3(compact.score + base) } : compact
+              // a box is found or not by the confidence as the model gave it, before it is rounded
+              const box = questions[id].type === 'box' && compact.box ? { found: answer.confidence >= FOUND_AT } : {}
+              put(rows[index].answers, id, base && typeof compact.score === 'number' ? { ...compact, score: round3(compact.score + base) } : { ...compact, ...box })
               continue
             }
-            if (answer?.error || (!answer && !Array.isArray(response.spans[offset]?.[wire]))) {
-              rows[index].answers[id] = compactAnswer(answer)
+            if (answer?.error || (!answer && !Array.isArray(marked))) {
+              put(rows[index].answers, id, compactAnswer(answer))
               continue
             }
             const { state, shift } = states[index]
             const read = typeof state === 'string' ? state : state[entry.over] ?? ''
             const question = questions[id]
-            let spans = placeSpans(response.spans[offset]?.[wire], read, { min: question.threshold ?? (question.preset === 'halu' ? HALU_AT : question.preset === 'pii' ? config.privacyAt ?? PII_AT : 0), overlaps: masked.has(id) })
+            let spans = placeSpans(marked, read, { min: question.threshold ?? (question.preset === 'halu' ? HALU_AT : question.preset === 'pii' ? config.privacyAt ?? PII_AT : 0), overlaps: masked.has(id) })
               .filter(span => span.start >= shift)
               .map(span => ({ ...span, start: span.start - shift, end: span.end - shift }))
             const kept = question.preset !== 'pii' || question.labels === 'all' ? undefined : question.labels ?? config.privacyLabels ?? SENSITIVE_LABELS
             if (kept) spans = spans.filter(span => kept.includes(span.label))
             if (question.preset === 'pii') spans = spans.map(span => trimSpan(span, items[index].text)).filter(Boolean)
-            // an item's id names it, whatever it looks like; personal data marked in it is said, and named by a pseudonym
+            // An item's id names it, whatever it looks like. What a hidden question (personal data, or what a redacted
+            // copy replaces) marks in it is said, and the id is named by a pseudonym.
             const named = typeof state === 'string' ? items[index].segments?.find(segment => segment.field !== undefined && segment.field === items[index].idField) : undefined
             const inId = span => named && span.start < named.end && span.end > named.start
-            if (question.preset === 'pii' && !idLabels.has(index)) {
-              const own = spans.find(span => inId(span) && !notPersonal(span, items[index].text))
+            if (masked.has(id) && !idLabels.has(index)) {
+              const own = spans.find(span => inId(span) && (question.preset !== 'pii' || !notPersonal(span, items[index].text)))
               if (own) idLabels.set(index, own.label)
             }
             spans = spans.filter(span => !inId(span) && !(question.preset === 'pii' && notPersonal(span, items[index].text)))
@@ -667,8 +748,8 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
             if (question.preset === 'evidence' && at !== undefined && entry.over === 'context') {
               spans = spans.map(span => ({ ...span, ...(span.start >= at ? sourceAt(sources.blocks, span.start - at) : { source: fields.context }) }))
             }
-            found[index][id] = spans
-            rows[index].answers[id] = {
+            put(found[index], id, spans)
+            put(rows[index].answers, id, {
               n: spans.length,
               p: round3(Math.max(0, ...spans.map(span => span.probability))),
               labels: labelCounts(spans),
@@ -676,63 +757,78 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
                 label: span.label,
                 start: span.start,
                 end: span.end,
-                ...(question.preset === 'pii' ? {} : { text: clip(span.text, 300) }),
+                ...(masked.has(id) ? {} : { text: clip(span.text, 300) }),
                 p: round3(span.probability),
                 ...(span.source ? { source: span.source, line: span.line } : {}),
               })),
-            }
+            })
           }
         })
       }
-      // a call that looks for personal data keeps it out of the results' text as well, and an item it could not look at
-      // keeps no text there
+      // What a hidden question marks (personal data, or what a redacted copy replaces) stays out of the results' text as
+      // well, and an item one of them could not look at keeps no text there.
       const personalIds = Object.keys(questions).filter(id => questions[id].preset === 'pii')
-      const personalOf = index => personalIds.flatMap(id => found[index][id] ?? [])
-      const unlooked = index => personalIds.some(id => rows[index].answers[id]?.error !== undefined)
+      const hiddenIds = [...masked]
+      const hiddenOf = index => hiddenIds.flatMap(id => found[index][id] ?? [])
+      const unlooked = index => hiddenIds.some(id => applies(id, index) && rows[index].answers[id]?.error !== undefined)
       for (const [index, item] of items.entries()) {
-        const spans = personalOf(index)
+        const spans = hiddenOf(index)
         if (unlooked(index)) delete rows[index].text
         else if (spans.length && item.source === undefined) rows[index].text = clip(redactItem(item, spans).text, 200)
+        // another question's marks hold what a hidden question marked inside them by its label only, in the results
+        // and in the summary's examples
+        if (!spans.length) continue
+        for (const id of marks.filter(own => !masked.has(own))) {
+          const shown = found[index][id]
+          if (!shown?.length || asked[id].over) continue
+          const moved = maskAround(item.text, shown, joined(everywhere(item.text, spans))).spans
+          rows[index].answers[id].spans.forEach((span, at) => {
+            span.text = clip(moved[at].text, 300)
+          })
+        }
       }
       // and one that looks for jailbreaks or harm keeps their words out: System Two reading the results reads no attack
       if (Object.values(questions).some(question => SAFETY_SIGNALS.has(question.signal))) for (const row of rows) delete row.text
 
-      // Item ids that are personal data, in a call that looks for personal data: what pii marked in an id's own field,
-      // or an id shaped as an email address, an IP address or a phone number. This result and the redacted copy name
-      // them by stable pseudonyms; the results file keeps each id beside its pseudonym, for you to act on.
+      // Item ids that are personal data, or that hold what a redacted copy replaces: what a hidden question marked in an
+      // id's own field, or, in a call that looks for personal data, an id shaped as an email address, an IP address or
+      // a phone number. This result and the redacted copy name them by stable pseudonyms; the results file keeps each id
+      // beside its pseudonym, for you to act on.
       let pseudonyms
       // a JSON object's keys that are personal data, named the same way in its redacted copy
       const keyAliases = []
+      const on = config.pseudonymIds !== false
       if (personalIds.length) {
         for (const [index, item] of items.entries()) {
           if (!idLabels.has(index) && item.idField !== undefined && personalShape(item.id)) idLabels.set(index, personalShape(item.id))
         }
-        const keyLabels = items.map(item => (item.key !== undefined ? personalShape(item.key) : undefined))
-        const on = config.pseudonymIds !== false
-        if (on && (idLabels.size || keyLabels.some(Boolean))) {
-          const key = await pseudonymKey()
-          for (const [index, label] of idLabels) rows[index].pseudonym = pseudonym(key, label, items[index].id)
-          keyLabels.forEach((label, index) => {
-            if (label) keyAliases[index] = pseudonym(key, label, items[index].key)
-          })
-        }
-        if (idLabels.size) {
-          const labels = labelCounts([...idLabels.values()].map(label => ({ label })))
-          const said = Object.entries(labels).map(([label, n]) => `${label} ${n}`).join(', ')
-          pseudonyms = { items: idLabels.size, labels, named: on ? 'pseudonyms' : 'kept' }
-          notes.push(on
-            ? `${idLabels.size} item id(s) are personal data (${said}): this result and the redacted copy name them by pseudonyms, as ${rows.find(row => row.pseudonym).pseudonym}, the same for the same id in every call; the results file keeps each id beside its pseudonym`
-            : `${idLabels.size} item id(s) are personal data (${said}), and they are kept as they are in this result, the results file and the redacted copy (pseudonymIds is off)`)
-        }
+      }
+      const keyLabels = personalIds.length ? items.map(item => (item.key !== undefined ? personalShape(item.key) : undefined)) : []
+      if (on && (idLabels.size || keyLabels.some(Boolean))) {
+        const key = await pseudonymKey()
+        for (const [index, label] of idLabels) rows[index].pseudonym = pseudonym(key, label, items[index].id)
+        keyLabels.forEach((label, index) => {
+          if (label) keyAliases[index] = pseudonym(key, label, items[index].key)
+        })
+      }
+      if (idLabels.size) {
+        const labels = labelCounts([...idLabels.values()].map(label => ({ label })))
+        const said = Object.entries(labels).map(([label, n]) => `${label} ${n}`).join(', ')
+        pseudonyms = { items: idLabels.size, labels, named: on ? 'pseudonyms' : 'kept' }
+        notes.push(on
+          ? `${idLabels.size} item id(s) are personal data (${said}): this result and the redacted copy name them by pseudonyms, as ${rows.find(row => row.pseudonym).pseudonym}, the same for the same id in every call; the results file keeps each id beside its pseudonym`
+          : `${idLabels.size} item id(s) are personal data (${said}), and they are kept as they are in this result, the results file and the redacted copy (pseudonymIds is off)`)
       }
       // what this result shows of each item: its pseudonym where it has one
       const shownRows = rows.map(({ pseudonym: alias, ...row }) => (alias ? { ...row, id: alias } : row))
+      // what a CSV and the first rows show of each row: no words of a hidden question, no cell for a question not asked
+      const show = index => ({ hidden: masked, unasked: unaskedOf(index) })
 
       // The results first: a copy or an image that fails later leaves them written.
       if (output) {
         await allowed(output, 'output')
         await mkdir(dirname(output), { recursive: true })
-        await writeResults(output, rows, questions, asked)
+        await writeResults(output, rows, questions, asked, show)
       }
 
       let redacted
@@ -750,11 +846,26 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
       if (copies) {
         const marking = [...masked]
         const out = copyTo
+        // A name in a record that holds what the copy replaces (a field's, as {"alice@example.test": "hello"} has, or a
+        // key's inside a value) takes its pseudonym, as an id does, so that two such names stay two; with pseudonymIds
+        // off it stays as it is, and the result says so.
+        const copiesOf = rename => items.map((item, index) => {
+          const spans = marking.flatMap(id => found[index][id] ?? [])
+          return spans.length ? redactItem(item, spans, { rename }) : { record: item.record, replaced: 0 }
+        })
+        let names = 0
+        let copied = copiesOf(name => {
+          names++
+          return name
+        })
+        if (names && on) {
+          const key = await pseudonymKey()
+          copied = copiesOf((name, label) => pseudonym(key, label, name))
+        } else if (names) notes.push(`${names} field name(s) hold what the copy replaces, and they are kept as they are in the redacted copy (pseudonymIds is off)`)
         let spanCount = 0
         let changed = 0
         const records = items.map((item, index) => {
-          const spans = marking.flatMap(id => found[index][id] ?? [])
-          const copy = spans.length ? redactItem(item, spans) : { record: item.record, replaced: 0 }
+          const copy = copied[index]
           spanCount += copy.replaced
           if (copy.replaced) changed++
           const alias = rows[index].pseudonym
@@ -776,7 +887,7 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
         await mkdir(dir, { recursive: true })
         annotated = { dir, files: [], skipped: [] }
         for (const [index, item] of items.entries()) {
-          const boxes = boxIds.map(id => rows[index].answers[id]).filter(a => a?.box && a.confidence >= FOUND_AT)
+          const boxes = boxIds.map(id => rows[index].answers[id]).filter(a => a?.box && a.found)
           if (!item.path || boxes.length === 0) continue
           const bytes = await readFile(item.path)
           let drawn
@@ -800,24 +911,29 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
           annotated.files.push(relative(cwd, out) || out)
         }
       }
-      const summary = summarize(questions, shownRows, asked)
+      const summary = summarize(questions, shownRows, asked, { hidden: masked, applies })
 
       // for Chat: a few marked items per span question, and the images with their boxes
       const examples = {}
       for (const [id, question] of Object.entries(questions)) {
         if (asked[id].kind !== 'span') continue
-        const kind = question.preset === 'pii' ? 'masked' : question.preset === 'halu' ? 'unsupported' : question.preset === 'evidence' ? 'evidence' : 'labels'
+        // what a hidden question marks shows by its label only, as personal data does
+        const kind = masked.has(id) ? 'masked' : question.preset === 'halu' ? 'unsupported' : question.preset === 'evidence' ? 'evidence' : 'labels'
         const picked = items.map((item, index) => ({ item, index, spans: found[index][id] ?? [] }))
           .filter(entry => entry.spans.length)
           .sort((x, y) => Math.max(...y.spans.map(span => span.probability)) - Math.max(...x.spans.map(span => span.probability)))
           .slice(0, 3)
         if (picked.length === 0) continue
-        examples[id] = picked.map(({ item, index, spans }) => {
+        put(examples, id, picked.map(({ item, index, spans }) => {
           let read = asked[id].over && typeof states[index].state === 'object' ? states[index].state[asked[id].over] : item.text
+          // an id named by a pseudonym is not shown in its own item's text either
+          const alias = rows[index].pseudonym && item.segments?.find(segment => segment.field !== undefined && segment.field === item.idField)
+          const ids = alias && read === item.text ? [{ label: idLabels.get(index), start: alias.start, end: alias.end, text: read.slice(alias.start, alias.end), probability: 1 }] : []
           // personal data wherever it recurs, as the redacted copy and the results file have it
-          let shown = kind === 'masked' ? joined(everywhere(read, spans)) : apart(spans)
-          const personal = kind === 'labels' && personalIds.length ? personalOf(index) : []
-          if (personal.length) ({ text: read, spans: shown } = maskAround(read, spans, read === item.text ? joined(everywhere(read, personal)) : personal))
+          let shown = kind === 'masked' ? joined(everywhere(read, [...spans, ...ids])) : apart(spans)
+          // and what a hidden question marked, masked in another question's excerpt, inside its marks too
+          const hidden = kind === 'labels' ? [...hiddenOf(index), ...ids] : []
+          if (hidden.length) ({ text: read, spans: shown } = maskAround(read, shown, read === item.text ? joined(everywhere(read, hidden)) : hidden))
           // evidence reads as a passage of its own file, or of the record's own context
           const block = kind === 'evidence' && spans[0].line !== undefined ? sources?.blocks.find(entry => entry.source === spans[0].source) : undefined
           if (block) {
@@ -834,13 +950,13 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
             parts: excerpts(read, shown, { hide: kind === 'masked', around: kind === 'evidence' ? 28 : 40, max: 1, clip: 120, rank: true })[0],
             ...(spans[0].source ? { source: placeOf(spans[0]) } : {}),
           }
-        })
+        }))
       }
       const shownImages = hasImages
-        ? items.slice(0, IMAGES_SHOWN).map((item, index) => ({
+        ? items.map((item, index) => ({ item, index })).filter(({ item }) => item.images).slice(0, IMAGES_SHOWN).map(({ item, index }) => ({
           id: item.id,
           path: item.path,
-          boxes: boxIds.map(id => ({ id, ...rows[index].answers[id] })).filter(a => a.box && a.confidence >= FOUND_AT).map(({ id, box, confidence }) => ({ id, box, confidence })),
+          boxes: boxIds.map(id => ({ id, ...rows[index].answers[id] })).filter(a => a.box && a.found).map(({ id, box, confidence }) => ({ id, box, confidence })),
           answers: Object.fromEntries(Object.entries(rows[index].answers).filter(([id]) => questions[id].type !== 'box').slice(0, 3)),
         }))
         : undefined
@@ -855,7 +971,7 @@ export function systemOneTool({ client, trace, config, workspaceOf = async () =>
         inputTokens,
         output,
         summary,
-        preview: shownRows.slice(0, 3).map(row => flatRow(row, questions, asked)),
+        preview: shownRows.slice(0, 3).map((row, index) => flatRow(row, questions, asked, show(index))),
         ...(Object.keys(examples).length ? { examples } : {}),
         ...(shownImages ? { images: shownImages } : {}),
         ...(redacted ? { redacted } : {}),

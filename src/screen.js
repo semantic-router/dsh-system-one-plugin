@@ -6,12 +6,16 @@ import { compactAnswer, unavailable, unavailableText } from './client.js'
 import { inputAt, kindAt, noFile } from './paths.js'
 import { deniedText, mayWrite } from './permissions.js'
 import { annotatePng, imageSize, undrawable } from './png.js'
-import { kindOf, readQuestions } from './rubric.js'
+import { kindOf, put, readQuestions } from './rubric.js'
 import { FOUND_AT } from './tool.js'
 import { clip } from './trace.js'
 
 export const SCREEN_TOOL = 'system_one_screen'
-const MAX_BYTES = 10 * 1024 * 1024
+// every model takes an image this large (the Decision API's default per image); a larger one is checked against the
+// model's own limit, which /api/info publishes, and left to System One when that cannot be read
+const IMAGE_BYTES = 8000000
+const LIMITS_FOR_MS = 600000
+const LIMITS_RETRY_MS = 15000
 const TYPES = { png: 'image/png', jpeg: 'image/jpeg', webp: 'image/webp' }
 
 const FIND_EXAMPLE = { save: 'the Save button of the billing form', error: 'an error message' }
@@ -76,10 +80,10 @@ async function readShot(cwd, path, name) {
   const bytes = await readFile(full)
   const size = imageSize(bytes)
   if (!size) throw new Error(`${path} is not a PNG, JPEG or WebP image`)
-  if (bytes.length > MAX_BYTES) throw new Error(`${path} is ${Math.round(bytes.length / 1048576)} MB, and System One takes screenshots of at most 10 MB`)
   return { path: full, shown: relative(cwd, full) || full, bytes, size, url: `data:${TYPES[size.type]};base64,${bytes.toString('base64')}` }
 }
 
+const megabytes = bytes => (bytes / 1e6).toFixed(1)
 const round3 = value => Math.round(value * 1000) / 1000
 const round4 = value => Math.round(value * 10000) / 10000
 const verdict = (p, yes, no) => (typeof p === 'number' ? `${p >= 0.5 ? yes : no} (p ${p})` : 'no answer')
@@ -127,6 +131,23 @@ export function screenPresentation(value, ui) {
  *   write (permissions.js `writePolicy`); undefined writes anywhere
  */
 export function screenTool({ client, trace, config, workspaceOf = async () => process.cwd(), writePolicyOf = async () => undefined }) {
+  // each model's image limit, as /api/info publishes it: read once in ten minutes, and again 15 s after it could not be
+  let limits
+  const imageLimit = async model => {
+    if (!limits || limits.until < Date.now()) {
+      const read = { until: Date.now() + LIMITS_FOR_MS }
+      read.ready = Promise.resolve()
+        .then(() => client.info?.())
+        .then(info => new Map((Array.isArray(info?.models) ? info.models : []).map(card => [card?.id, card?.limits?.max_image_bytes]).filter(([, bytes]) => Number.isFinite(bytes))))
+        .catch(error => {
+          read.until = Date.now() + LIMITS_RETRY_MS
+          trace({ ev: 'limits', error: clip(String(error?.message ?? error), 200) })
+          return new Map()
+        })
+      limits = read
+    }
+    return (await limits.ready).get(model)
+  }
   return defineTool({
     name: SCREEN_TOOL,
     description: DESCRIPTION,
@@ -183,7 +204,7 @@ export function screenTool({ client, trace, config, workspaceOf = async () => pr
         if (question.type === 'box') {
           let key = id
           for (let n = 2; Object.hasOwn(find, key); n++) key = `${id} (${n})`
-          find[key] = question.instructions
+          put(find, key, question.instructions)
           delete check[id]
           notes.push(`check ${id} is a box question: looked for under find`)
         } else if (kindOf(question) !== 'decision') throw new Error(`check "${id}": ask a noul, choice or score question here (span questions, presets and signals read text), and put what to locate in find`)
@@ -197,6 +218,13 @@ export function screenTool({ client, trace, config, workspaceOf = async () => pr
       }
       const before = given(args.before) ? await readShot(cwd, args.before, 'before') : undefined
       const model = args.model || config.screenModel
+      for (const image of [shot, before].filter(Boolean)) {
+        if (image.bytes.length <= IMAGE_BYTES) continue
+        const limit = await imageLimit(model)
+        if (limit !== undefined && image.bytes.length > limit) {
+          throw new Error(`${image.shown} is ${megabytes(image.bytes.length)} MB, and ${model} takes images of at most ${megabytes(limit)} MB: pass a smaller screenshot (a part of the screen, or a lower resolution)`)
+        }
+      }
       const context = typeof args.context === 'string' ? args.context.trim() : ''
 
       // wire ids of System One's own, so that no id reaches a router signal's trained head
@@ -227,6 +255,11 @@ export function screenTool({ client, trace, config, workspaceOf = async () => pr
           const at = await kindAt(named)
           const into = at === 'directory' || (at === undefined && !/\.(png|jpe?g|webp)$/i.test(named))
           annotateTo = into ? join(named, basename(shot.path)) : named
+          // the copy is a PNG, so its name says so
+          if (!/\.png$/i.test(annotateTo)) {
+            annotateTo = `${annotateTo.slice(0, annotateTo.length - extname(annotateTo).length)}.png`
+            notes.push(`annotate writes a PNG, so the copy is ${relative(cwd, annotateTo) || annotateTo}`)
+          }
         }
         // never onto a screenshot the call reads, under any name it has
         const reads = [shot.path, ...(before ? [before.path] : [])]
@@ -268,26 +301,28 @@ export function screenTool({ client, trace, config, workspaceOf = async () => pr
       const answers = seen?.answers[0] ?? {}
       const found = {}
       const checks = {}
+      // the pixel to click, at the box's centre and always on the screenshot: 0 to its width less one
+      const pixel = (value, size) => Math.min(size - 1, Math.max(0, Math.round(value * size)))
       for (const [wire, { kind, id }] of Object.entries(ids)) {
         const answer = answers[wire]
         if (kind === 'check') {
-          checks[id] = compactAnswer(answer)
+          put(checks, id, compactAnswer(answer))
           continue
         }
         if (!answer || answer.error || !answer.box) {
-          found[id] = { what: find[id], error: answer?.error ?? 'missing' }
+          put(found, id, { what: find[id], error: answer?.error ?? 'missing' })
           continue
         }
         const { left, top, right, bottom } = answer.box
-        const confidence = round3(answer.confidence)
-        found[id] = {
+        put(found, id, {
           what: find[id],
           box: { left: round4(left), top: round4(top), right: round4(right), bottom: round4(bottom) },
           pixels: { left: Math.round(left * width), top: Math.round(top * height), right: Math.round(right * width), bottom: Math.round(bottom * height) },
-          click: { x: Math.round(((left + right) / 2) * width), y: Math.round(((top + bottom) / 2) * height) },
-          confidence,
-          found: confidence >= FOUND_AT,
-        }
+          click: { x: pixel((left + right) / 2, width), y: pixel((top + bottom) / 2, height) },
+          confidence: round3(answer.confidence),
+          // found or not by the confidence as the model gave it: 0.3996 is below 0.4, though it reads 0.4 rounded
+          found: answer.confidence >= FOUND_AT,
+        })
       }
       const p = answer => (typeof answer?.noul === 'number' ? round3(answer.noul) : undefined)
 

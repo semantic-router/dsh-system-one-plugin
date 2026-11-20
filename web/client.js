@@ -110,6 +110,18 @@ window.__ModuleLoader__.load({
       const IMAGES_KEPT = 96
       const IMAGE_TYPES = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp' }
 
+      // The oldest images read go first once more than IMAGES_KEPT are kept, each URL revoked as it goes. An image still
+      // being read is never one of them, as it has no URL to revoke yet, nor the one just read, whose URL its frame is
+      // about to show: the cache trims again as each read settles, so every URL it made is revoked when it leaves.
+      function trimImages(kept) {
+        for (const [key, entry] of images) {
+          if (images.size <= IMAGES_KEPT) return
+          if (entry.url === undefined || entry === kept) continue
+          images.delete(key)
+          URL.revokeObjectURL(entry.url)
+        }
+      }
+
       function imageEntry(sessionId, path) {
         const key = `${sessionId}\n${path}`
         let entry = images.get(key)
@@ -122,15 +134,12 @@ window.__ModuleLoader__.load({
             throw new Error(result?.error?.message ?? `${path} could not be read`)
           }
           entry.url = URL.createObjectURL(new Blob([result.value.data], { type }))
+          trimImages(entry)
           return entry.url
         })
         entry.promise.catch(() => images.delete(key))
         images.set(key, entry)
-        if (images.size > IMAGES_KEPT) {
-          const [oldest, old] = images.entries().next().value
-          images.delete(oldest)
-          if (old.url) URL.revokeObjectURL(old.url)
-        }
+        trimImages(entry)
         return entry
       }
 
@@ -338,6 +347,9 @@ window.__ModuleLoader__.load({
         const what = spans ? `${plural(spans, 'span')} of text (${plural(num(row.removedChars) ?? 0, 'character')})` : plural(lines, 'line')
         const withheld = num(row.withheld)
         const rest = withheld ? ` System One screens the first ${plural(num(row.screenedChars) ?? 0, 'character')} of a result; System Two got none of the last ${plural(withheld, 'character')}, only a note to read them in parts.` : ''
+        // passages System One answered with an error, which went on unscreened beside what it removed
+        const unscreened = num(row.unscreened)
+        const left = unscreened ? ` System One could not screen ${plural(unscreened, 'passage')} of it, which System Two read as they were.` : ''
         return {
           verdict: row.verdict, ...verdict, subject: { tool: row.tool, text: row.call },
           facts: [
@@ -345,16 +357,17 @@ window.__ModuleLoader__.load({
             { id: 'injection', label: 'Injection', value: p2(row.maxP), bar: num(row.maxP), tone: row.maxP >= 0.5 ? 'bad' : undefined },
             ...(spans ? [{ id: 'spans', label: 'Spans removed', value: String(spans) }] : []),
             ...(withheld ? [{ id: 'withheld', label: 'Withheld', value: plural(withheld, 'character'), tone: 'warn' }] : []),
+            ...(unscreened ? [{ id: 'unscreened', label: 'Not screened', value: plural(unscreened, 'passage'), tone: 'warn' }] : []),
           ],
           excerpts: Array.isArray(row.excerpts) ? { list: row.excerpts, kind: 'removed' } : undefined,
-          note: row.verdict === 'removed' ? `Removed ${what} that gave orders to AI agents before System Two read the result${spans ? '; the text around it stayed' : ''}.${rest}`
+          note: row.verdict === 'removed' ? `Removed ${what} that gave orders to AI agents before System Two read the result${spans ? '; the text around it stayed' : ''}.${rest}${left}`
             : row.verdict === 'flagged' ? `Found ${what} that give orders to AI agents; the result was withheld.`
-              : rest ? rest.trim() : undefined,
+              : rest || left ? `${rest}${left}`.trim() : undefined,
         }
       }
 
       function privacyView(row) {
-        if (row.error) return errorView(row, { text: 'so the result went to System Two unmasked', tone: 'warn' })
+        if (row.error) return errorView(row, { text: num(row.masked) ? 'so part of the result went to System Two unmasked' : 'so the result went to System Two unmasked', tone: 'warn' })
         if (row.verdict === 'clean') {
           return { verdict: 'clean', label: 'Nothing to mask', short: 'nothing to mask', tone: 'ok', subject: row.call ? { tool: row.tool, text: row.call } : undefined, facts: [{ id: 'masked', label: 'Masked', value: '0' }] }
         }

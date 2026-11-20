@@ -84,16 +84,22 @@ The reflexes read DeepSeek Harness's tools by what the tools do, not by a few na
 
 - **Shield** (`shieldTools`) screens every result that brings in text from files (`read`, `grep`, `glob`,
   `str_replace_editor`), shells (`bash`, Windows' `pwsh`, a background job's `job_output`), the web (`web_fetch`,
-  `web_search`) or an MCP server (`read_mcp_resource`, `mcp__*`). It screens a result of any length that has a word in
-  it (`shieldMinChars`, 0), in passages of about 700 characters, nine to a request: every passage of the first 60,000
-  characters (`shieldMaxChars`). System Two gets none of the rest. In its place a note says how many characters were
-  withheld unscreened and asks System Two to read them in parts (a range of lines, a narrower search or command), and
-  the card says **Rest withheld**. A `read` returns at most 50 KB, so a file is screened whole; a long web page or a
-  long command output can be cut. If the shield cannot answer, the result passes as it is and its card says so.
+  `web_search`) or an MCP server (`read_mcp_resource`, `mcp__*`), an error result as well (a page's error body, a
+  command's stderr). It screens a result of any length that has a word in it (`shieldMinChars`, 0), in passages of
+  about 700 characters, nine to a request: every passage of the first 60,000 characters (`shieldMaxChars`). System Two
+  gets none of the rest. In its place a note says how many characters were withheld unscreened and asks System Two to
+  read them in parts (a range of lines, a narrower search or command), and the card says **Rest withheld**. A `read`
+  returns at most 50 KB, so a file is screened whole; a long web page or a long command output can be cut. If the
+  shield cannot answer, the result passes as it is and its card says so; a passage System One answers with an error in
+  place (`invalid_question`) counts the same way, never as clean, and the card says how many were not screened. The
+  lines DeepSeek Harness writes into a shell's output (`[stderr]`, `(no output)`, the sandbox notes that end it) are
+  masked while scoring and never removed; the same words anywhere else (in a file, a page, the middle of a command's
+  output) are screened as any text is. A rewritten result keeps its images and other blocks beside the text.
 - **Privacy** (`privacyTools`) masks the text of files, shells and the web: `read`, `grep`, `str_replace_editor`,
-  `bash`, `pwsh`, `job_output`, `web_fetch` and `web_search`, all of a result, in windows of 12,000 characters that end
-  at a line break or a space. `glob`'s file names and MCP tools are masked only when you name them: a masked name in a
-  path would leave System Two unable to open the file.
+  `bash`, `pwsh`, `job_output`, `web_fetch` and `web_search`, all of a result, error results too, in windows of 12,000
+  characters that end at a line break or a space. `glob`'s file names and MCP tools are masked only when you name them:
+  a masked name in a path would leave System Two unable to open the file. A window System One answers with an error in
+  place is not masked, and the **Privacy** card says so, beside what it masked in the others.
 - **Guard** (`guardTools`) reviews every call that runs a command (`bash`, `pwsh`), writes a file (`write`, `edit`,
   `apply_patch`, and `str_replace_editor` but for its `view`), sends data out (`web_fetch`'s address, `web_search`'s
   queries), plans a prompt for later (`schedule_create`, `schedule_update`) or acts through an MCP server (`mcp__*`).
@@ -102,7 +108,13 @@ The reflexes read DeepSeek Harness's tools by what the tools do, not by a few na
   overlap by 300, so that a command across a window's end is seen whole in the next. The riskiest window decides, and
   the card names its dangerous part. A call longer than that is never allowed unasked, however safe its start: the
   guard asks you, and with `guardAskMode: deny` (or headless, where nobody can answer) it is denied with the advice to
-  split it into calls System One can read whole. The card says how much of a long call it read.
+  split it into calls System One can read whole. The card says how much of a long call it read. A question of the
+  guard's that System One answers with an error in place (risk, leaks secrets, on task) is no answer: the call gets
+  `guardOnError`, as when System One cannot be reached, unless what was answered already asks about it or blocks it.
+- **Done-check** asks whether the work is complete, checked and waiting on you. When System One answers one of them
+  with an error in place, the card says it could not check and the turn ends as it is, never as "done"; a claim check
+  it could not answer counts no unsupported claims. It weighs the latest reads first, and a read too long to fit is
+  left out while the earlier ones still go in.
 
 ### System Two through the router
 
@@ -124,8 +136,11 @@ helps it read the right things and shows what it picked:
   whether the model thinks. Chat shows them in one muted line under the turn's answer (see below).
 
 DeepSeek Harness 0.2.2 and later take the request headers through `llm-pi-ai/request-headers`; with 0.2.1, and to read
-the answer's headers, the plugin wraps `fetch` for the router's chat request alone, inside the call that makes it.
-Requests to any other provider, and every other request, are left as they are.
+the answer's headers, the plugin wraps `fetch` for the router's chat request alone, inside the call that makes it, and
+only to the router's host: the base URL DeepSeek Harness 0.2.2 names for the request, or, with 0.2.1, the host the
+call's first chat request goes to. A chat request to any other host inside the call, and a model call to another
+provider made inside it, get none of these headers. Requests to any other provider, and every other request, are left
+as they are.
 
 ### Span answers and router signals (vllm-sr/vela3-turbo)
 
@@ -174,7 +189,7 @@ lines of a text file, a list of strings, or images. It writes the rubric; each q
 | `{"type": "noul", "instructions": "..."}` | the probability of yes |
 | `{"type": "score", "criteria": [...]}` | the expected level of an ordered scale, from 0, or on the levels' own numbers (`"1 = vague"`, `"2 = clear"`) |
 | `{"type": "box", "instructions": "..."}` | where an image shows it, as a box in fractions of the image (images only) |
-| `{"type": "span", "criteria": {"ERROR": "...", "COMPETITOR": "..."}}` | the words that carry each of your labels, with offsets and a probability each |
+| `{"type": "span", "criteria": {"ERROR": "...", "COMPETITOR": "..."}}` | the words that carry each of your labels, with offsets and a probability each; `threshold` (0 to 1, both included) drops less probable marks |
 | `{"preset": "pii"}` | personal data: the nine sensitive labels, or the ones `labels` picks (`"all"` for every label it knows) |
 | `{"preset": "halu"}` | the words of the item that its `sources` do not support |
 | `{"preset": "evidence"}` | the words of the `sources` that back the item, with their file and line |
@@ -185,7 +200,18 @@ Each call writes one result row per item (`<file>.s1.jsonl` beside its file, `<f
 images, or a CSV) and returns a summary System Two reads instead of the items. A question carries only `type`,
 `instructions` and `criteria` (span questions also `over` and `threshold`); other fields are dropped. A question
 that fails for its items says why in the summary. Requests stay within the Decision API's estimate, which counts an
-item's state once for every question that reads it; an item no request could read is refused with what to change.
+item's state once for every question that reads it, and within its 64 questions per request; an item no request could
+read is refused with what to change. A call that holds both images and texts asks each item what it can answer: box
+questions of the images, span questions, presets and signals of the texts, the others of both; a box answer is found
+when its confidence, as the model gives it, is 0.4 or more.
+
+Each item is read as it is written: a line of a text file keeps its indentation, a number or `true` in a JSON file is
+read as its text, and the source files' line numbers count the blank lines they start with. An item longer than
+`toolMaxChars` (6,000 characters), or a field `state_fields` reads, is read up to there, and the Notes line says how
+many were. A CSV keeps every row and cell: a row of empty cells is an item, a header written twice names its second
+column `<name>_2`, and the cells past the header's last are read as `column_<n>`, each said in the Notes line. Every
+item has an id of its own: a file's row number, an inline item's number or an image's name that an earlier item has
+takes the next free number, or the image's path, and the Notes line says so; an id the items carry themselves stays.
 
 System Two writes a rubric in many shapes. A shape that can mean one thing only is read as that thing, and the
 summary's **Notes** line says how, so a wrong reading can be put right:
@@ -193,14 +219,17 @@ summary's **Notes** line says how, so a wrong reading can be put right:
 - a span question's labels written as its own fields (`{"type": "span", "ERROR": "…", "COMPETITOR": "…"}`), as a list
   of labels, as text (`"ERROR: an error code; COMPETITOR: another product"`) or under `labels`; a choice's options as
   a list or under `options`; a score's levels as an object or under `levels`;
-- a `threshold`, `type` or `instructions` written beside the questions (they are theirs), one question written in
-  place of the object of questions or wrapped in its type (`{"where": {"box": {...}}}`), a list of questions with
-  their ids, a question id written twice (its two halves joined, or two different questions both asked), the object
-  written as JSON text twice over, JSON that ends before its last brackets or with one too many, and the next
-  arguments run into `questions` by the model's tool-call markup;
+- a `threshold`, `type`, `over` or `instructions` written beside the questions (they are theirs, when the value can be
+  one: a number, a type's name, a field's name, instructions for a question without any; else it is a question of that
+  id, as `{"threshold": "Is it urgent?"}`), one question written in place of the object of questions or wrapped in its
+  type (`{"where": {"box": {...}}}`), a list of questions with their ids, a question id written twice (its two halves
+  joined, or two different questions both asked), the object written as JSON text twice over, JSON that ends before its
+  last brackets or with one too many, and the next arguments run into `questions` by the model's tool-call markup
+  (never valid JSON that quotes that markup);
 - other names for a type (`yes_no`, `classification`, `rating`, `bbox`, `spans`), a preset (`hallucination`) or a
   signal (`jailbreak`), instructions written as `question`, `description`, `prompt` or `query`, a box question's target
-  as `target`, `what`, `find` or `id`, a threshold as text, as a whole percentage or as `{"min": 0.5}`;
+  as `target`, `what`, `find` or `id`, a threshold as text, as a whole percentage or as `{"min": 0.5}`, and criteria
+  named `no` and `yes`, or `false` and `true`, without a type, as a yes/no question;
 - a label set written as a choice (one option, or options named in capitals under instructions such as "Mark the
   words of …") is asked as a span question;
 - `redact` without a pii or span question replaces personal data (preset pii is asked for it); where no copy can be
@@ -224,7 +253,11 @@ Beside the rubric:
 - `redact`: a copy of the items with what `pii` marked (else what the span questions marked) replaced by its
   `[LABEL]`, in the input's format: `true` for `<file>.redacted.<ext>`, or a path. Each item's id stays, as do the
   ids in its text that the span model takes for names (`C-2087`), and a marked person's name is masked wherever it
-  or a part of it recurs in the item.
+  or a part of it recurs in the item. The copy keeps each record's shape: a nested object stays an object (a marked
+  number in it becomes its `[LABEL]`), an array stays an array, and a name that holds what the copy replaces (a
+  field's, as `{"alice@example.test": "hello"}` has, or a key's inside a value) takes its pseudonym, as an id does.
+  Whatever the copy replaces is kept out of what System Two reads, as personal data is: the summary's examples, the
+  first rows' `<id>_spans`, the results file's span texts and Chat's excerpts show its label only.
 - `annotate`: a directory for PNG copies of the images with the boxes found drawn in red, or `true` for a copy beside
   each image (`<name>.annotated.png`). An image it cannot draw on (not a PNG, a PNG of 16 bits or of fewer than 8 per
   channel, an interlaced one) is answered all the same and listed with why, and its boxes are in the results.
@@ -234,15 +267,19 @@ The results file holds one row per item: its id, its answers and the start of it
 words into System Two's context. In a CSV, and in the first rows the summary shows, each answer takes a column of its
 own beside the item's `id` (a choice its id and `<id>_confidence`, a yes/no question `<id>_yes`, a span question
 `<id>`, `<id>_labels` and `<id>_spans`), and every header is escaped as a cell is, so a question id with a comma, a
-quote or a line break keeps its column. A question named `id` or `pseudonym`, or two questions whose answers would
-take one column (`team` beside a question named `team_confidence`), are refused before anything is asked, with what
-to rename.
+quote or a line break keeps its column. A cell that starts as a spreadsheet formula does (`=`, `+`, `-`, `@`, a tab or a
+carriage return), in the results and in a redacted CSV copy, starts with a `'`, so that a spreadsheet shows a record's
+id of `=1+1` as text; a plain number stays as it is. A question named `id` or `pseudonym`, or two questions whose
+answers would take one column (`team` beside a question named `team_confidence`), are refused before anything is
+asked, with what to rename. A score question's levels count under the words before their colon (`Low` of `Low: can
+wait`), or under their whole labels when two would share them.
 
 **Item ids that are personal data.** An item keeps its id, so that the results, the redacted copy and the summary
 match. In a call that looks for personal data (preset `pii`, or `redact`), an id that is personal data, because pii
-marks it in the id's own field or because it is shaped as an email address, an IP address or a phone number, is named
-by a pseudonym in everything System Two reads of the call (the summary, its first rows and examples) and in the
-redacted copy, as `EMAIL_ADDRESS-3f9a2c1b0d`: its label and 10 hex digits of an HMAC-SHA256 of the id under a key that
+(or the span question a redacted copy replaces) marks it in the id's own field, or because it is shaped as an email
+address (its domain in any script), an IP address (v4 or v6) or a phone number, is named by a pseudonym in everything
+System Two reads of the call (the summary, its first rows and examples) and in the redacted copy, as
+`EMAIL_ADDRESS-3f9a2c1b0d`, and so is a JSON object's key of that shape: its label and 10 hex digits of an HMAC-SHA256 of the id under a key that
 stays on your machine, so one id has one pseudonym in every call and every copy, and nobody without the key can tell
 which id it stands for by hashing guesses. The results file keeps each id beside its pseudonym (`pseudonym`), for you
 to act on. The summary's Notes line says how many ids were named this way. `pseudonymIds: false` keeps such ids as
@@ -278,15 +315,20 @@ For computer use, System One is the eyes of each step. System Two gives it one s
 - `before` and `action`: the screenshot from before the last action and what that action was; System One says
   whether it worked, from the two screenshots (`before` alone is judged as the last step of the task).
 - `annotate`: a PNG copy with the boxes in red and the click points in blue: a `.png` path, a folder for it (a path
-  without an image extension), or `true` for one beside the screenshot. A copy named as a screenshot the call reads
-  (`image` or `before`, under any name) goes beside `image`; a screenshot the annotator cannot draw on is answered,
-  with a note and no copy.
+  without an image extension), or `true` for one beside the screenshot; a path with another image extension takes
+  `.png`, and the Notes line says so. A copy named as a screenshot the call reads (`image` or `before`, under any name)
+  goes beside `image`; a screenshot the annotator cannot draw on is answered, with a note and no copy. A transparent
+  colour of the screenshot (a PNG's `tRNS` key) stays transparent in the copy.
 
 What to ask written under another name (`targets` for `find`, `checks` for `check`, `expected` for `expect`), a
 question written alone as `question`, and a box question written as a check are read as what they mean.
 
 It answers in about a second (`screenModel`, `vllm-sr/vela3-turbo` by default). Coordinates are pixels of the
-screenshot, from its top left corner.
+screenshot, from its top left corner; the pixel to click is always on it, and a target is found when its confidence,
+as the model gives it, is 0.4 or more. A screenshot larger than 8,000,000 bytes is checked against the model's own
+limit, as [System Duo](https://app.vllm-sr.ai/api/info) publishes it (`vllm-sr/vela3-turbo` 8,000,000 bytes,
+`vllm-sr/d3-ultra` 16,777,216), and refused before it is sent when it is over it; when the limits cannot be read,
+System One decides.
 
 ## See it in the Web UI
 
@@ -378,7 +420,7 @@ target) and `point` (where to click), the `targets`, each `target` (`data-system
 `checks`, `expect`, and an `action` with the `before` and `after` screens, and `annotated`. Each number is a
 `data-system-one-fact`: `kind`, `effort`, `unclear` and `risky` (triage), `risk`, `leaks`, `on-task`, the router
 signals `harm` (the call) and `request-harm` (the request it serves), and `reviewed` (how much of a long call it read)
-(guard), `passages`, `injection`, `spans` and `withheld` (shield), `masked` (privacy), `complete`, `checked`, `waiting`, the router signal `declined`, `unsupported` and
+(guard), `passages`, `injection`, `spans`, `withheld` and `unscreened` (passages System One could not screen) (shield), `masked` (privacy), `complete`, `checked`, `waiting`, the router signal `declined`, `unsupported` and
 `backed` (done-check), and in a screen row each check by its id. Decision rows carry `data-system-one-decision` and
 `data-system-one-call`. For example:
 
@@ -436,12 +478,14 @@ The local trace (`~/.dsh/system-one/trace.jsonl`, readable by you only) records 
 Every string is redacted before it is written: keys and tokens by their shape (`sk-…`, `hf_…`, `ghp_…`, `npm_…`,
 JWTs, private key blocks), authorization headers, cookies, credentials in URLs, and the values of fields, variables
 and flags named for a key, token, secret or password (`DECISION_API_KEY=…`, `"api_key": …`, `--token …`). A trace
-that an earlier version wrote is scrubbed the same way, once, when the plugin starts (its first line then says so).
-Set `trace: off` to disable it.
+that an earlier version wrote is scrubbed the same way, once, when the plugin starts (its first line then says so),
+written over in place when another program holds it open (as Windows allows); one that cannot be scrubbed at all is
+never written to: the trace stops, and a warning says why. Set `trace: off` to disable it.
 
 The key of the pseudonyms that name item ids holding personal data (`~/.dsh/system-one/pseudonyms.key`, readable by
-you only) is made on first use and never leaves your machine. Delete it to start new pseudonyms; with it, someone
-could test which id a pseudonym stands for, so keep it as you keep the results files.
+you only) is made on first use and never leaves your machine; it is written whole before it takes its name, so two
+processes starting at once share one key, and a key file left empty is replaced. Delete it to start new pseudonyms;
+with it, someone could test which id a pseudonym stands for, so keep it as you keep the results files.
 
 For the Web UI, each decision is also written to the session's own log as a plugin record
 (`plugin:vllm-sr/dsh/system-one`): its answers, model, latency and verdict, and the reviewed call in short with
@@ -533,8 +577,18 @@ second request.
 The key comes from the credential reference `VLLM_SR_API_KEY` (`llmKeyEnv`), which both systems use. A separate
 System One key in `DECISION_API_KEY` (`apiKeyEnv`), as plugin 0.2 kept it, still wins for System One; a 0.2 key for
 `vllm-sr/auto` keeps working too.
-If the decision service cannot be reached, a guarded call falls back to `guardOnError` (default `allow`); the
-harness's own sandbox and approvals still apply.
+If the decision service cannot be reached, or answers one of the guard's questions with an error in place, a guarded
+call falls back to `guardOnError` (default `allow`), and its card says why; the harness's own sandbox and approvals
+still apply.
+
+`vllm-sr/auto` is described to DeepSeek Harness (in the plugin's `cordis.patch.yml`) with Norn-1's context window,
+1,048,576 tokens, and an answer of at most 32,000 tokens, as [the docs](https://app.vllm-sr.ai/docs) give them, so a
+session is compacted only as it nears that window. A profile patch that replaces the `vllm-sr` provider row replaces
+these values too.
+
+On its first start the plugin keeps the key it fetched in `~/.dsh/.env`; a line there that names the key with no value
+(`VLLM_SR_API_KEY=`) takes the new key. When DeepSeek Harness's credential store cannot be read, the line under your
+request says so, as for a key the site refused.
 
 The plugin sends at most `maxConcurrency` requests to System One at once (12; at least 1, so 0 means 1). The
 `system_one` tool's batches use all but one of them, so the triage, the guard, the shield, privacy and the done-check

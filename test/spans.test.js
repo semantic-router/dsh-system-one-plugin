@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { everywhere, joined } from '../src/redact.js'
-import { excerpts, idAsData, labelCounts, maskLabel, notPersonal, onPlaceholder, placeSpans, replaceSpans, toCommands, toSentences, trimSpan, unnumber, windows } from '../src/spans.js'
+import { excerpts, idAsData, labelCounts, maskAround, maskLabel, notPersonal, onPlaceholder, placeSpans, replaceSpans, toCommands, toSentences, trimSpan, unnumber, windows } from '../src/spans.js'
 
 test('span offsets in code points land on the right UTF-16 range, even after an emoji', () => {
   const text = 'Hi 👋 Ada, mail ada@example.com today'
@@ -215,4 +215,23 @@ test('a line longer than a window is cut after a space, so an email address stay
   const cut = windows(emoji, 101)
   assert.equal(cut.map(part => part.text).join(''), emoji)
   assert.ok(cut.every(part => part.text.length <= 101 && !/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/.test(part.text)))
+})
+
+test('an excerpt of one question\'s marks never shows what another hid: a hidden span inside a shown one is masked there too', () => {
+  const text = 'Contact ada@example.test today.'
+  const shown = [{ label: 'CONTACT_LINE', start: 0, end: 24, text: 'Contact ada@example.test', probability: 0.63 }]
+  const hidden = [{ label: 'EMAIL_ADDRESS', start: 8, end: 24, text: 'ada@example.test', probability: 0.998 }]
+  const masked = maskAround(text, shown, hidden)
+  assert.equal(masked.text, 'Contact [EMAIL_ADDRESS] today.')
+  assert.deepEqual(masked.spans.map(span => [span.start, span.end, span.text]), [[0, 23, 'Contact [EMAIL_ADDRESS]']])
+  const parts = excerpts(masked.text, masked.spans)[0]
+  assert.doesNotMatch(JSON.stringify(parts), /ada@/)
+  // a span that starts inside a hidden one takes the label whole
+  const across = maskAround(text, [{ label: 'DOMAIN', start: 12, end: 31, text: 'example.test today.', probability: 0.7 }], hidden)
+  assert.equal(across.spans[0].text, '[EMAIL_ADDRESS] today.')
+})
+
+test('labels of any name are counted as their own: constructor and __proto__ too', () => {
+  const counts = labelCounts([{ label: 'constructor' }, { label: '__proto__' }, { label: 'constructor' }, { label: 'toString' }])
+  assert.deepEqual(Object.entries(counts), [['constructor', 2], ['__proto__', 1], ['toString', 1]])
 })

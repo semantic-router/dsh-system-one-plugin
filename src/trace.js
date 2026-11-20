@@ -90,7 +90,26 @@ function redactedAlready(line) {
   }
 }
 
-/** The trace file, owner-only: a new one starts with its header, an older one is scrubbed in place. */
+// the scrubbed lines of `scratch` written over `path` itself, for a file that cannot be replaced
+async function overwrite(path, scratch) {
+  const handle = await open(path, 'r+')
+  try {
+    let position = 0
+    for await (const chunk of createReadStream(scratch)) {
+      await handle.write(chunk, 0, chunk.length, position)
+      position += chunk.length
+    }
+    await handle.truncate(position)
+  } finally {
+    await handle.close()
+  }
+}
+
+/**
+ * The trace file, owner-only: a new one starts with its header, an older one is scrubbed: into a scratch file that
+ * takes its place, or, where it cannot (a program holds it open without letting it be replaced, as Windows allows),
+ * written over it.
+ */
 async function prepare(path) {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 })
   let first
@@ -117,21 +136,28 @@ async function prepare(path) {
     out.end()
     await closed
     await chmod(scratch, 0o600)
-    await rename(scratch, path)
-  } catch (error) {
+    try {
+      await rename(scratch, path)
+    } catch (error) {
+      await overwrite(path, scratch).catch(() => {
+        throw error
+      })
+    }
+  } finally {
     await rm(scratch, { force: true })
-    throw error
   }
 }
 
 /**
  * @param {string | undefined} path - no path disables the trace
- * @returns {((entry: object) => void) & {ready: Promise<void>}} records written once the file is prepared
+ * @returns {((entry: object) => void) & {ready: Promise<void>}} records written once the file is prepared; a trace an
+ *   earlier version wrote that could not be scrubbed gets none, and the trace stops with a warning
  */
 export function createTrace(path) {
   if (!path) return Object.assign(() => {}, { ready: Promise.resolve() })
   const waiting = []
   let prepared = false
+  let off = false
   const append = line => {
     try {
       appendFileSync(path, line + '\n', { mode: 0o600 })
@@ -139,11 +165,19 @@ export function createTrace(path) {
       // A trace write must never fail an agent step.
     }
   }
-  const ready = prepare(path).catch(() => {}).finally(() => {
+  const ready = prepare(path).catch(async error => {
+    // a trace that still holds what an earlier version wrote, unscrubbed, is never written to
+    const first = await firstLine(path).catch(() => undefined)
+    if (first === undefined || redactedAlready(first)) return
+    off = true
+    process.stderr.write(`[System One] The trace is off: ${path} holds records an earlier version wrote, which may hold keys, and it could not be scrubbed (${error?.code ?? error?.message ?? error}). Close what holds it open and restart, or delete it.\n`)
+  }).finally(() => {
     prepared = true
-    for (const line of waiting.splice(0)) append(line)
+    const lines = waiting.splice(0)
+    if (!off) for (const line of lines) append(line)
   })
   function record(entry) {
+    if (off) return
     let line
     try {
       line = JSON.stringify({ t: new Date().toISOString(), ...entry }, scrubbed)

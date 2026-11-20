@@ -22,8 +22,9 @@
             name: vllm-sr/auto
             # the router sends a request that carries an image to its vision decision, tool calls and all
             input: [text, image]
-            contextWindow: 131072
-            maxTokens: 32768
+            # Norn-1's window and its longest answer, as https://app.vllm-sr.ai/docs gives them
+            contextWindow: 1048576
+            maxTokens: 32000
 
 - id: agent-default-model
   config:
